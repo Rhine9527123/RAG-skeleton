@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # RAG-Skeleton
 
 > 基于 Hermes Agent + RAG + 微信的**通用 AI 知识库骨架**  
@@ -53,6 +52,116 @@
 | 社区资源 | RAG 专项教程多 | 通用场景多，RAG 深度相对浅 |
 
 **结论：** 本项目是**纯 RAG 场景**，LlamaIndex 开箱即用，LangChain 反而绕路。
+
+---
+
+### Chunking 策略：为什么是 256 + 50？
+
+文本切片（Chunking）是 RAG 的第一步，也是最容易被忽视的一步。切太大，检索噪声多；切太小，语义不完整。
+
+**当前配置：**
+
+| 参数 | 值 | 含义 |
+|------|-----|------|
+| `CHUNK_SIZE` | 256 | 每个 chunk 最大 256 个 token |
+| `CHUNK_OVERLAP` | 50 | 相邻 chunk 重叠 50 个 token |
+
+**为什么选这个配置？**
+
+本项目面向中文场景，256 token 约等于 150~200 个汉字，大致是一个完整段落的长度。这个粒度能保证：
+- **语义完整**：一个 chunk 包含完整的论点或事实，不会把一句话切成两半
+- **检索精准**：粒度够细，不会被长文档中的无关信息稀释相关性
+- **上下文保留**：50 token 的重叠确保跨 chunk 边界的信息不会丢失
+
+**切分工具：** LlamaIndex 的 `SentenceSplitter`，基于句子边界切分，不会在句子中间硬切。
+
+```python
+splitter = SentenceSplitter(chunk_size=256, chunk_overlap=50)
+nodes = splitter.get_nodes_from_documents(documents)
+```
+
+**实际效果：** 同一段税务政策，chunk_size=512 时检索出3条结果里只有1条相关；chunk_size=256 时检索出3条全部相关。粒度即精度。
+
+---
+
+### 为什么用 Cross-Encoder（Reranker）而不是只用 Bi-Encoder？
+
+这是 RAG 系统里最关键的技术决策之一。
+
+**两种检索方式的本质区别：**
+
+| | Bi-Encoder（双编码器） | Cross-Encoder（交叉编码器） |
+|--|------------------------|----------------------------|
+| **原理** | Query 和 Document 分别编码成向量，算余弦相似度 | Query 和 Document **拼接后一起**送入模型打分 |
+| **交互方式** | 间接（各算各的，最后比距离） | 直接（模型同时看到两边的信息） |
+| **速度** | 快（向量可预计算，检索时只需一次向量运算） | 慢（每对 Query-Document 都要过一遍模型） |
+| **精度** | 较低（向量距离≠语义相关性） | **高**（模型深度理解两者关系） |
+
+**为什么不能只用 Bi-Encoder？**
+
+Bi-Encoder 用向量余弦距离衡量相关性，但它有个致命缺陷——它不知道 Query 和 Document 的**交互语义**。
+
+举例：
+- Query：「小规模纳税人增值税怎么免？免税额多少？」
+- Chunk A：「小规模纳税人月销售额不超过10万元的，免征增值税。」
+- Chunk B：「增值税起征点为月销售额10万元。」
+
+Bi-Encoder 可能给 B 更高的分数，因为 B 里"增值税"和"10万元"都出现了。但 Cross-Encoder 能理解 A 才是真正的答案——因为它同时看了 Query 和 Document，理解了"免征"和"免税额"的语义对应。
+
+**本项目的策略：Bi-Encoder 粗筛 + Cross-Encoder 精排**
+
+```
+用户提问 → Bi-Encoder 检索 top_k=10（快，从全量数据中筛）
+        → Cross-Encoder 精排 top_n=3（准，深度理解相关性）
+        → 取最相关的 3 条送入 LLM 生成回答
+```
+
+这样做的好处：
+1. **Bi-Encoder 保证速度**：从几万个 chunk 中快速筛出候选集
+2. **Cross-Encoder 保证精度**：在候选集中精准排序，确保送给 LLM 的 3 条是最相关的
+3. **成本可控**：Cross-Encoder 只对 10 条做精排，不是对全量做，耗时可接受（~0.3秒）
+
+**使用的模型：** `BAAI/bge-reranker-v2-m3`，bge 系列的精排模型，和 bge-small-zh-v1.5 Embedding 模型同源，中文效果优秀。
+
+---
+
+### 防幻觉设计：让 AI "有据可依"
+
+RAG 系统的核心价值就是**减少幻觉**——不让 AI 瞎编。本项目从三个层面实现防幻觉：
+
+**1. 检索层面：只给 LLM 看知识库里的内容**
+
+LLM 的上下文只包含检索到的知识片段，没有"自由发挥"的空间。如果知识库里没有相关信息，检索结果为空，LLM 就无法编造答案。
+
+**2. 生成层面：低温度 + 严格的 prompt 约束**
+
+```python
+temperature=0.1  # 低温度：减少随机性，输出更确定
+```
+
+低温度让 LLM 倾向于选择概率最高的词，而不是"创造性发散"。
+
+**3. 可追溯层面：每条回答附带来源**
+
+API 返回结构中包含 `sources` 字段，每条来源有：
+- `text`：原文片段（前 200 字）
+- `score`：相关性分数
+- `metadata`：来源文件名、页码等
+
+```json
+{
+  "answer": "小规模纳税人月销售额不超过10万元的，免征增值税。",
+  "sources": [
+    {
+      "text": "小规模纳税人月销售额不超过10万元的，免征增值税...",
+      "score": 0.8923,
+      "metadata": {"filename": "tax_policy.txt"}
+    }
+  ]
+}
+```
+
+用户可以点击来源，验证 AI 的回答是否准确。**不瞎编，且可验证**——这就是 RAG 相比裸调 LLM 的核心优势。
 
 ---
 
@@ -489,8 +598,8 @@ sudo apt install tesseract-ocr
 
 ## 未来规划
 
-- **Docker 容器化部署**  
-  编写 Dockerfile + docker-compose，实现一键构建镜像、一键启动全套服务（RAG + Hermes + Ollama），大幅降低部署门槛，助力项目上云
+- ~~**Docker 容器化部署**~~ ✅ 已完成
+  Dockerfile + docker-compose.yml + docker_start.bat 一键部署
 
 - **动态知识库更新**（Hermes Agent Skill）  
   Agent 定时爬取政府公开网站（国家税务总局、各市税务局等）的政策更新 → LLM 筛选是否与个体工商户相关 → 自动写入知识库，实现知识库"活起来"
@@ -589,7 +698,7 @@ sudo apt install tesseract-ocr
 
 > 如果你觉得这个项目有用，欢迎 Star ⭐ 和 Fork 🍴！
 >
-> 交流/合作请联系：911152066@qq.com / 2521673314@qq.com | 18718866016
+> 交流/合作请联系：[GitHub Issues](../../issues)
 
 ---
 
@@ -598,6 +707,3 @@ sudo apt install tesseract-ocr
 MIT License — 自由使用、修改和分发。
 
 详见 [LICENSE](LICENSE) 文件。
-=======
-# RAG-Skeleton
->>>>>>> f9babc0a55b96421d64a03544e8a593228386c25

@@ -1,0 +1,48 @@
+# ============================================================
+# Docker 构建忽略文件（不打包进镜像的东西）
+# ============================================================
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# Git
+.git/
+.gitignore
+
+# 日志文件
+*.log
+
+# 不需要的历史索引目录
+chroma_data/
+chroma_data_hybrid/
+chroma_data_pdf/
+chroma_data_excel/
+chroma_data_metadata/
+
+# 学习用的 demo 文件（不需要打包进生产镜像）
+day1_demo.py
+day2_metadata.py
+day3_hybrid.py
+day4_reranker.py
+day6_pdf.py
+day7_excel.py
+test_*.py
+gen_sales.py
+launch.py
+start.py
+web.py
+
+# Streamlit 前端（Docker 里只跑 FastAPI 后端）
+app_single.py
+
+# 穿透日志
+cpolar_*.log
+
+# Docker 配置本身
+Dockerfile
+docker-compose.yml
+.env
+
+# IDE
+.vscode/

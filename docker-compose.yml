@@ -1,0 +1,47 @@
+# ============================================================
+# RAG + Hermes 一键部署配置
+# ============================================================
+# 启动命令：docker compose up -d
+# 停止命令：docker compose down
+# 查看日志：docker compose logs -f
+# ============================================================
+
+services:
+  # ---- RAG 财务知识库服务 ----
+  rag-service:
+    build: .                          # 用当前目录的 Dockerfile 构建
+    container_name: rag-service
+    ports:
+      - "8000:8000"                   # 宿主机8000 -> 容器8000
+    env_file:
+      - .env                          # 从 .env 文件读取环境变量（API Key等）
+    volumes:
+      # 知识库文档和向量索引挂载到宿主机（持久化）
+      - ./data:/app/data                              # 知识库文档
+      - ./chroma_data_server:/app/chroma_data_server   # 向量索引（持久化）
+    restart: unless-stopped        # 崩溃自动重启
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/docs')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ---- Hermes Agent ----
+  hermes:
+    image: ghcr.io/soulter/hermes-agent:latest    # 官方镜像，直接拉
+    container_name: hermes-agent
+    ports:
+      - "3000:3000"                   # Hermes Web UI
+    volumes:
+      - ./hermes-data:/opt/data        # Hermes 数据目录（配置、记忆等）
+    environment:
+      # Hermes 通过 Docker 内网访问 RAG 服务
+      # 在 docker-compose 网络中，服务名就是主机名
+      - RAG_API_URL=http://rag-service:8000
+    env_file:
+      - .env
+    restart: unless-stopped
+    depends_on:
+      rag-service:
+        condition: service_healthy     # 等 RAG 健康检查通过后再启动 Hermes
