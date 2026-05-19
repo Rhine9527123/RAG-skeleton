@@ -635,8 +635,7 @@ sudo apt install tesseract-ocr
 
 ### 3. Hermes Agent 调用 RAG API
 
-![Hermes调用RAG-1](screenshots/hermes_rag_1.png)
-![Hermes调用RAG-2](screenshots/hermes_rag_2.png)
+![Hermes调用RAG](screenshots/hermes_rag_1.png)
 
 *Hermes 界面调用 RAG API，回答「个体户如何报税」问题*
 
@@ -644,27 +643,9 @@ sudo apt install tesseract-ocr
 
 ### 4. 微信接入效果
 
-![微信问答-1](screenshots/wechat_qa_1.jpg)
-![微信问答-2](screenshots/wechat_qa_2.jpg)
+![微信问答](screenshots/wechat_qa_1.jpg)
 
 *微信聊天界面，用户通过 Hermes + RAG 获取专业回答*
-
----
-
-### 5. 后端服务日志
-
-![后端日志-1](screenshots/backend_1.png)
-![后端日志-2](screenshots/backend_2.png)
-
-*FastAPI 后端启动及运行日志，模型加载完成后等待请求*
-
----
-
-### 6. 开发过程记录
-
-![Python开发日志](screenshots/dev_log.png)
-
-*Python 代码开发过程中的日志输出*
 
 ---
 
