@@ -360,7 +360,7 @@ Ollama 让你**断网也能用**，本地运行大模型。
 ### 第四步：下载项目
 
 ```bash
-git clone https://github.com/你的用户名/RAG-Skeleton.git
+git clone https://github.com/Rhine9527123/RAG-Skeleton.git
 cd RAG-Skeleton
 ```
 
