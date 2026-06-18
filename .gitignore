@@ -37,3 +37,17 @@ env/
 
 # ChromaDB 本地索引（包含向量数据，不适合提交）
 chroma_data_metadata/
+
+# BM25 索引（本地生成）
+bm25_index/
+
+# 会话数据库（运行时生成）
+sessions.db
+sessions.db-shm
+sessions.db-wal
+
+# 本地备份
+backups/
+
+# 草稿文件
+README_v0.3_draft.md

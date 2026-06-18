@@ -5,7 +5,7 @@ cd /d "%~dp0"
 set USERNAME=User
 
 echo ============================================================
-echo          RAG 财务知识库 - 一键启动
+echo          RAG-Skeleton 知识库 - 一键启动
 echo ============================================================
 echo.
 
@@ -20,7 +20,7 @@ if %errorlevel% neq 0 (
     :: 再次检测
     curl -s --connect-timeout 3 http://127.0.0.1:11434/api/tags >nul 2>&1
     if %errorlevel% neq 0 (
-        echo       [警告] Ollama 启动失败，将使用 Kimi 云端模式
+        echo       [警告] Ollama 启动失败，将使用云端 API 模式
         set USE_OLLAMA=false
         goto :start_backend
     )

@@ -27,13 +27,15 @@
 
 | 特性 | 说明 |
 |------|------|
-| **通用骨架** | 知识库与业务逻辑分离，换领域只需替换知识文件 |
+| **通用骨架** | 知识库与业务逻辑分离，换领域只需替换知识文件 + 切换预设 |
 | **混合检索** | 向量检索 + BM25 关键词检索，双路并行，不漏答案 |
 | **Reranker 精排** | 对检索结果二次精排，进一步提升准确率 |
+| **锚点判断** 🆕 | 提取用户问题关键词与知识库高频词对比，自动分流 Fast RAG / Agentic RAG |
+| **Agentic RAG 追问** 🆕 | 检索质量不足时主动追问，引导用户换问法，不硬编回答 |
 | **双 LLM 模式** | 有网用 DeepSeek（质量高），断网用 Ollama（本地离线） |
 | **Hermes Agent 集成** | 通过 MCP 协议接入，支持记忆、推理、多轮对话 |
 | **微信直连** | iLink Bot API，扫码登录，无需公网 IP |
-| **多格式支持** | txt / pdf（含表格+OCR）/ xlsx（自动生成行摘要+统计概要） |
+| **多格式支持** | txt / pdf（含表格+嵌入图片OCR）/ xlsx（自动生成行摘要+统计概要） |
 | **完全本地部署** | 数据不出本机，隐私安全 |
 
 ---
@@ -139,29 +141,144 @@ LLM 的上下文只包含检索到的知识片段，没有"自由发挥"的空�
 temperature=0.1  # 低温度：减少随机性，输出更确定
 ```
 
-低温度让 LLM 倾向于选择概率最高的词，而不是"创造性发散"。
+低温度让 LLM 倾向于选择概率最高的词，而不是"创造性发散"。同时，user prompt 明确要求：
+
+> 请严格基于上述参考资料回答，不要发散或添加资料中没有的信息。回答要简洁直接。如果资料中未找到相关内容，请明确说明"资料中未找到相关内容"。
 
 **3. 可追溯层面：每条回答附带来源**
 
 API 返回结构中包含 `sources` 字段，每条来源有：
 - `text`：原文片段（前 200 字）
-- `score`：相关性分数
+- `score`：相关性分数（0~1，越高越相关）
 - `metadata`：来源文件名、页码等
 
-```json
-{
-  "answer": "小规模纳税人月销售额不超过10万元的，免征增值税。",
-  "sources": [
-    {
-      "text": "小规模纳税人月销售额不超过10万元的，免征增值税...",
-      "score": 0.8923,
-      "metadata": {"filename": "tax_policy.txt"}
-    }
-  ]
-}
+前端在答案下方用小字直接展示引用资料及匹配度：
+
+```
+📚 引用资料: [1] tax_policy.txt (87.3%) | [2] guide.md (65.2%) | [3] ...
 ```
 
-用户可以点击来源，验证 AI 的回答是否准确。**不瞎编，且可验证**——这就是 RAG 相比裸调 LLM 的核心优势。
+用户可以点击展开查看原文片段，验证 AI 的回答是否准确。**不瞎编，且可验证**——这就是 RAG 相比裸调 LLM 的核心优势。
+
+---
+
+### 锚点判断：Fast RAG vs Agentic RAG 🆕
+
+传统 RAG 对每个问题都走相同的检索流程——检索、排序、生成，不管问题是否清晰、是否命中知识库领域。这在简单问题上浪费了 Reranker 算力，在模糊问题上又硬编出低质量回答。
+
+**本项目引入锚点判断机制**，通过提取用户问题的关键词、与知识库高频词对比，自动决定走快速检索还是 Agentic 追问。锚点集的更新借鉴了 LSM-Tree 的写入缓冲思路（新文档先进内存缓冲，攒够一批再合并刷盘），避免每次上传都全量重建。
+
+#### 核心思路
+
+```
+用户提问
+  ↓ 提取问题中的关键词（字符 n-gram）
+  ↓ 与知识库高频词（锚点集）匹配
+  ├─ 命中 ≥ 2 个 → Fast RAG（直接检索 + Reranker + 生成）
+  └─ 命中 < 2 个 → Agentic RAG
+       ├─ top_score ≥ 0.3 → 仍尝试检索回答
+       └─ top_score < 0.3 → 追问用户（给出主题提示，引导换问法）
+```
+
+**什么是"锚点"？** 离线扫描知识库所有文档，用字符 n-gram（2~4字滑动窗口）提取高频词，这些高频词就是"锚点"——它们代表了知识库的核心主题。比如一个税务知识库，"纳税人"、"增值税"、"免征"这些词会高频出现，自然成为锚点。用户提问时，如果问题里包含足够多的锚点词，说明问题落在知识库领域内，走 Fast RAG；否则走 Agentic RAG。
+
+#### 方案选型：我的想法 vs AI 建议
+
+在实现这个判断机制时，每个关键环节我都有自己的设计想法，同时也对比了 AI 给出的常规建议。以下是选型对比和决策理由：
+
+**环节 1：关键词提取——用什么方式从问题和文档中提取关键词？**
+
+| | 我的方案 | AI 建议 |
+|--|---------|---------|
+| 方法 | 字符 n-gram（2~4字滑动窗口） | jieba 分词 + TF-IDF 统计 |
+| 依赖 | 零外部依赖，纯 Python 标准库 `re` + `Counter` | 需安装 jieba |
+| 领域适配 | 通用，任何领域直接可用 | 通用词典对专业术语切分不准（如"小规模纳税人"可能被切成"小规模"+"纳税人"） |
+| 新词发现 | n-gram 天然覆盖未登录词 | 需维护自定义词典 |
+
+**为什么选 n-gram？** 三个原因：第一，实际开发中 jieba 安装失败（Windows 环境兼容性问题），被迫找替代方案，发现 n-gram 效果反而更好；第二，通用分词器对垂直领域术语不友好，而 n-gram 不需要预定义词典，高频词自然浮现为锚点；第三，零依赖意味着部署更简单，Docker 镜像更小。
+
+**环节 2：锚点集更新——知识库动态变化时，锚点集怎么更新？**
+
+| | 我的方案 | AI 建议 |
+|--|---------|---------|
+| 方法 | LSM-Tree 风格：新文档 n-gram 先进内存缓冲（pending_buffer），攒够 20 篇再全量合并刷盘（anchor_set.json） | 方案 A：每次上传都全量重建锚点集；方案 B：用 Redis/数据库做增量索引 |
+| 写入开销 | O(1) 追加到内存，20 篇才触发一次 O(n) 重建 | 方案 A 每次都 O(n)；方案 B 引入额外中间件 |
+| 读取 | 合并查询 pending_buffer + anchor_set.json | 方案 A 直接读单文件；方案 B 查数据库 |
+| 复杂度 | 低（一个 JSON 文件 + 一个内存 Set） | 方案 A 低但慢；方案 B 高（需维护数据库） |
+
+**为什么选 LSM-Tree 风格？** 知识库会频繁变化——用户不断上传新文档。如果每次上传都全量扫描重建锚点集，O(n) 太慢；如果引入 Redis 等中间件，部署复杂度直线上升。LSM-Tree 的"写缓冲 + 批量合并"思路刚好解决这个问题：新文档的 n-gram 先进内存（MemTable），攒够一批再合并刷盘（SSTable），读时合并查两者。用最简单的数据结构（Python Set + JSON 文件）实现了高效的批量更新，不需要任何额外中间件。
+
+**环节 3：问题清晰度判断——怎么判断用户问题是否"模糊"？**
+
+| | 我的方案 | AI 建议 |
+|--|---------|---------|
+| 方法 | 双阈值规则：锚点命中数 < 2 **且** 检索 top_score < 0.3 → 判定为模糊，触发追问 | 方案 A：用 LLM 做意图分类（调用一次 LLM 判断问题是否清晰）；方案 B：训练一个轻量分类模型 |
+| 延迟 | ~0ms（纯规则计算，无额外请求） | 方案 A +1~2秒（多一次 LLM 调用）；方案 B 需训练 + 推理 |
+| 成本 | 零 API 调用 | 方案 A 每次问答多一次 LLM API 费用 |
+| 准确性 | 锚点命中数是"问题是否落在知识库领域内"的直观代理，实测有效 | 方案 A 准确但贵；方案 B 需要标注数据 |
+
+**为什么选双阈值规则？** 锚点命中数本质上回答了一个问题：**"用户的提问跟我的知识库相关吗？"** 如果用户问"今天天气怎么样"，而知识库是税务领域的，锚点命中数会是 0——这个判断不需要 LLM，简单的词匹配就够了。再加上检索 top_score 作为第二道关卡，双重确认后才触发追问，避免误判。不额外调用 LLM 意味着零延迟、零成本，而且规则可解释、可调试。
+
+#### Agentic RAG 追问：不硬编低质量回答
+
+当用户问题锚点命中不足且检索匹配度低时，系统不会硬编一个低质量回答，而是**主动追问**：
+
+```
+🤔 Agentic RAG 追问
+您的提问在知识库中匹配度较低。
+当前知识库涵盖以下主题：税务政策、小规模纳税人、增值税免征、...
+建议您尝试以下问法：
+- "小规模纳税人增值税怎么免？"
+- "增值税起征点是多少？"
+```
+
+主题提示词通过 `get_topic_hints()` 从锚点集提取，**中文优先排序**（CJK 字符检测 + 长度降序），避免显示一堆英文碎片。
+
+#### 前端路由可视化
+
+前端在答案输出**之前**就显示路由徽章，让用户知道走了哪条路径：
+
+| 路由类型 | 显示效果 | 含义 |
+|---------|---------|------|
+| 🚀 Fast RAG | `st.caption` 小字 | 锚点命中充足，快速回答 |
+| 🧠 Agentic RAG | `st.info` 蓝色提示框 | 锚点命中不足，但仍尝试检索回答 |
+| 🤔 Agentic 追问 | `st.warning` 黄色警告框 | 匹配度太低，需要用户换个问法 |
+
+**实现技巧**：在 `st.write_stream` 之前先 `next(gen)` 偷看第一个 token，此时所有前置 SSE 事件（route_info / progress）已被消费，可以提前拿到路由信息并渲染徽章。
+
+**关键文件：** `anchor_manager.py`（~370行），核心类 `AnchorSetManager`。
+
+#### 效果演示
+
+以下截图展示了锚点判断机制在真实场景中的表现（知识库为税务领域）：
+
+**场景1：问题与知识库完全不相关 → 触发追问**
+
+用户问"你好"，0/2 锚点命中，系统判定为无关问题，返回主题提示引导换问法：
+
+![无关问题触发追问](screenshots/agentic_clarify_irrelevant.png)
+
+**场景2：问题太模糊，0 锚点命中 → 触发追问**
+
+用户问"报税怎么报"，虽然涉及税务但缺少具体关键词（如"个体户""增值税"），0/2 锚点命中，系统提示换个更具体的问法：
+
+![模糊问题触发追问](screenshots/agentic_clarify_0anchor.png)
+
+**场景3：命中 1 个锚点 → Agentic RAG 尝试回答**
+
+用户问"个体户报税怎么报"，命中"个体户"这 1 个锚点（< 阈值 2），走 Agentic RAG 路径。由于检索质量尚可（top_score ≥ 0.3），系统仍尝试基于知识库回答，给出完整的增值税申报、个所税申报、年度报告等结构化答案：
+
+![Agentic RAG 尝试回答(1)](screenshots/agentic_1anchor_answer1.png)
+
+![Agentic RAG 尝试回答(2)](screenshots/agentic_answer2.png)
+
+![Agentic RAG 尝试回答(3)](screenshots/agentic_answer3.png)
+
+**场景4：引用资料详情**
+
+展开「查看详细片段」面板后，可看到每条来源的文件名、相关度百分比、分类标签和原始文本片段：
+
+![来源资料详情](screenshots/source_detail_expanded.png)
 
 ---
 
@@ -184,7 +301,8 @@ async def lifespan(app: FastAPI):
     # 1. 加载 Embedding 模型（~5秒）
     # 2. 加载 Reranker 模型（~10秒，Ollama 模式跳过）
     # 3. 构建向量索引 + BM25 索引（~15秒）
-    # 4. 组装 query_engine
+    # 4. 初始化锚点判断管理器
+    # 5. 组装 query_engine
     yield
     # ← 这里写关闭逻辑（进程退出时执行）
 ```
@@ -197,7 +315,7 @@ async def lifespan(app: FastAPI):
 | 后续每次问答 | ~31 秒 | **< 2 秒** |
 | 并发能力 | 无 | 支持多请求复用同一引擎 |
 
-**关键代码位置：** `server.py` 第 306 行 `lifespan` 函数。
+**关键代码位置：** `server.py` `lifespan` 函数。
 
 ---
 
@@ -256,11 +374,11 @@ LLM 根据 `description` 自动判断**什么时候该调这个工具**。
 
 | 知识库内容 | 文件类型 | 测试目的 |
 |-------------|----------|----------|
-| 纳税政策（税务条文） | txt | 验证政策类文本问答准确性 |
-| 体考政策（体育升学政策 PDF） | pdf | 验证 PDF 表格 + 文本混合解析 |
-| 个体工商户营业流水（销售数据） | xlsx | 验证结构化数据的行摘要 + 统计概要 |
+| 政策条文（示例知识） | txt | 验证政策类文本问答准确性 |
+| 结构化数据报告（含表格 PDF） | pdf | 验证 PDF 表格 + 文本混合解析 |
+| 业务流水数据（销售记录） | xlsx | 验证结构化数据的行摘要 + 统计概要 |
 
-**结论：** 同一套骨架，换知识库无需改代码，问答质量取决于知识文件质量。
+**结论：** 同一套骨架，换知识库 + 切预设，问答质量取决于知识文件质量。
 
 ---
 
@@ -289,12 +407,14 @@ Hermes Agent（调度中心：记忆 + 推理 + 工作流）
 rag_mcp_server.py（MCP 翻译层）
         ↓  HTTP (localhost:8000)
 server.py（FastAPI 后端）
-        ↓  LlamaIndex
-向量索引（ChromaDB）+ BM25 索引 + Reranker
+        ↓
+锚点判断（anchor_manager.py）
+    ├─ Fast RAG → 向量检索 + BM25 + Reranker → LLM 生成
+    └─ Agentic RAG → 多角度检索 / 追问用户
         ↓
 知识库（data/ 目录，支持 txt/pdf/xlsx）
         ↓
-LLM 层（DeepSeek 在线 / Ollama 离线）
+LLM 层（DeepSeek 在线 temperature=0.1 / Ollama 离线）
 ```
 
 ---
@@ -302,22 +422,77 @@ LLM 层（DeepSeek 在线 / Ollama 离线）
 ## 项目结构
 
 ```
-finance-rag/                  # 项目根目录
-├── server.py                 # FastAPI 后端（RAG 服务核心）
-├── web.py                   # Streamlit 前端界面
+RAG-Skeleton/                # 项目根目录
+├── server.py                # FastAPI 后端（RAG 服务核心 + 路由分发）
+├── web.py                   # Streamlit 前端界面（路由徽章 + 引用展示）
+├── anchor_manager.py        # 锚点判断管理器（LSM-Tree 风格）🆕
 ├── rag_mcp_server.py        # MCP Server 封装（供 Hermes 调用）
 ├── 启动.bat                 # Windows 一键启动脚本
+├── config.py                # 中心化配置（领域切换入口）
 ├── requirements.txt         # Python 依赖清单
-├── config.json              # 服务配置文件（可选）
+├── cleaner.py               # 内容清洗管线
+├── crawler.py               # 多源内容爬虫
+├── pipeline.py              # 知识库更新流水线
+├── dedup.py                 # 去重模块
+├── demo/                    # 示例/教程文件（参考学习用）
+│   ├── app_single.py
+│   ├── config_ui.py
+│   └── day*.py
 ├── data/                    # 知识库原始文件（丢文件到这里即可）
-│   ├── tax_policy.txt
-│   ├── sales_data.xlsx
-│   └── ...
-├── chroma_data_server/      # 向量索引持久化（自动生成，勿手动修改）
-└── models/                  # 本地模型缓存（可选，自动下载）
+│   ├── metadata.json        # 元数据标签映射（可选）
+│   └── ...                  # 你的知识文件
+├── chroma_data_server/      # 向量索引持久化（自动生成）
+└── models/                  # 本地模型缓存（自动下载）
     └── BAAI/
         ├── bge-small-zh-v1.5/
         └── bge-reranker-v2-m3/
+```
+
+## 🆕 领域切换（v0.2.0 新增）
+
+所有领域相关的字符串（提示词、界面文字、关键词等）集中在 `config.py` 中管理。
+
+### 方式一：环境变量（最简单）
+
+```bash
+# 设为 finance（财经）— 使用内置预设
+set RAG_DOMAIN=finance
+
+# 或 medical（医疗）
+set RAG_DOMAIN=medical
+
+# 或 legal（法律）
+set RAG_DOMAIN=legal
+
+# 或完全自定义任何参数
+set RAG_APP_NAME=我的知识库
+set RAG_SYSTEM_PROMPT=你是XX领域的专家...
+```
+
+### 方式二：修改 config.py 预设
+
+编辑 `config.py`，在 `DOMAIN_PRESETS` 中添加自己的预设，或修改现有预设。
+
+```python
+DOMAIN_PRESETS = {
+    "my_domain": {
+        "app_name": "我的领域助手",
+        "system_prompt": "你是...",
+        "domain_keywords": ["关键词1", "关键词2"],
+        # ... 其他配置
+    },
+}
+```
+
+### 元数据标签（data/metadata.json）
+
+可以在 `data/metadata.json` 中为每个知识文件指定分类标签和来源：
+
+```json
+{
+  "tax_policy.txt": {"category": "政策法规", "source": "政府网站"},
+  "health_guide.pdf": {"category": "医疗健康", "source": "卫健委"}
+}
 ```
 
 ---
@@ -382,10 +557,21 @@ pip install -r requirements.txt
 | `pymupdf` | PDF 解析 |
 | `pandas` / `openpyxl` | Excel 解析 |
 | `chromadb` | 向量数据库 |
+| `python-dotenv` | .env 文件加载 🆕 |
 
 ### 第六步：配置 API Key
 
-**方式 A — 环境变量（推荐）：**
+**方式 A — .env 文件（推荐）：**
+
+在项目根目录创建 `.env` 文件（参考 `.env.example`）：
+
+```env
+DEEPSEEK_API_KEY=sk-your-key-here
+```
+
+服务启动时通过 `python-dotenv` 自动加载，无需手动设置环境变量。
+
+**方式 B — 环境变量：**
 
 ```bash
 # Windows PowerShell
@@ -394,16 +580,6 @@ $env:DEEPSEEK_API_KEY="sk-your-key-here"
 # Linux / macOS
 export DEEPSEEK_API_KEY="sk-your-key-here"
 ```
-
-**方式 B — 修改 `server.py` 默认值：**
-
-打开 `server.py`，找到这一行（约第 359 行）：
-
-```python
-deepseek_api_key = os.environ.get("DEEPSEEK_API_KEY", "sk-你的key")
-```
-
-把 `"sk-你的key"` 替换成你的 DeepSeek Key。
 
 ### 第七步：下载 Embedding 模型（国内用户）
 
@@ -492,8 +668,7 @@ cp 药品说明书.xlsx data/
 python server.py
 ```
 
-启动时会自动重新构建索引，完成后即可对话。
-
+启动时会自动重新构建索引 + 锚点集，完成后即可对话。
 ---
 
 ## API 文档
@@ -502,7 +677,8 @@ python server.py
 
 | 接口 | 方法 | 说明 |
 |------|------|------|
-| `/chat` | POST | RAG 问答（核心接口，返回答案 + 来源） |
+| `/chat` | POST | RAG 问答（核心接口，返回答案 + 来源 + 判断信息） |
+| `/chat/stream` | POST | RAG 问答（SSE 流式，实时输出 token） |
 | `/upload` | POST | 上传知识文件（txt / pdf / xlsx） |
 | `/files` | GET | 查看知识库文件列表 |
 | `/files/{filename}` | DELETE | 删除指定知识文件并重建索引 |
@@ -513,8 +689,41 @@ python server.py
 ```bash
 curl -X POST http://localhost:8000/chat \
   -H "Content-Type: application/json" \
-  -d '{"question": "小规模纳税人增值税税率是多少？"}'
+  -d '{"question": "这个领域的核心政策是什么？"}'
 ```
+
+### 返回结构
+
+```json
+{
+  "answer": "小规模纳税人月销售额不超过10万元的，免征增值税。",
+  "sources": [
+    {
+      "text": "小规模纳税人月销售额不超过10万元的，免征增值税...",
+      "score": 0.8923,
+      "metadata": {"filename": "tax_policy.txt"}
+    }
+  ],
+  "route_info": {
+    "route": "fast",
+    "hits": 3,
+    "threshold": 2,
+    "tokens": ["纳税人", "增值税", "免征"],
+    "needs_clarification": false
+  },
+  "session_id": "abc123"
+}
+```
+
+`route_info` 字段说明：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `route` | string | `"fast"` 或 `"agentic"` |
+| `hits` | int | 用户问题命中的锚点数量 |
+| `threshold` | int | 分流阈值（默认 2） |
+| `tokens` | string[] | 命中的锚点词列表 |
+| `needs_clarification` | bool | 是否需要追问用户 |
 
 ---
 
@@ -568,8 +777,8 @@ hermes restart
 **原因：** DeepSeek API Key 未配置或配置错误。
 
 **解决：**
-- 检查环境变量 `DEEPSEEK_API_KEY` 是否设置
-- 或直接在 `server.py` 里把 Key 写死（不推荐，仅开发用）
+- 检查 `.env` 文件中 `DEEPSEEK_API_KEY` 是否正确
+- 或设置环境变量 `DEEPSEEK_API_KEY`
 
 ### Q：Ollama 模式报 `resource module not available on Windows`
 
@@ -592,7 +801,13 @@ sudo apt install tesseract-ocr
 
 ### Q：如何确认 RAG 在正常工作？
 
-访问 `http://localhost:8000/docs`，用 `/chat` 接口测试，观察返回的 `sources` 字段是否有内容。
+访问 `http://localhost:8000/docs`，用 `/chat` 接口测试，观察返回的 `sources` 字段是否有内容。同时检查 `route_info.route` 是否为 `"fast"`（命中锚点）或 `"agentic"`（未命中）。
+
+### Q：为什么有时候 AI 不直接回答而是追问？ 🆕
+
+**原因：** Agentic RAG 追问机制触发。当用户问题命中的锚点不足且检索匹配度低于 0.3 时，系统判定问题与知识库领域不匹配或过于模糊，主动追问引导用户换问法，而不是硬编低质量回答。
+
+**解决：** 按追问提示的主题词重新组织问题，或向知识库上传更多相关文档。
 
 ---
 
@@ -601,17 +816,23 @@ sudo apt install tesseract-ocr
 - ~~**Docker 容器化部署**~~ ✅ 已完成
   Dockerfile + docker-compose.yml + docker_start.bat 一键部署
 
-- **动态知识库更新**（Hermes Agent Skill）  
-  Agent 定时爬取政府公开网站（国家税务总局、各市税务局等）的政策更新 → LLM 筛选是否与个体工商户相关 → 自动写入知识库，实现知识库"活起来"
+- ~~**锚点判断机制**~~ ✅ 已完成
+  LSM-Tree 风格锚点管理 + Fast/Agentic RAG 双路分流 + 追问机制
 
-- **结合真实账本数据分析**  
-  接入 SQLite 账本数据（app.py），回答"我这个月利润多少"、"哪类商品最赚钱"等经营分析类问题
+- **Agentic RAG 多轮改写检索**  
+  当前 Agentic 路径仅做单次检索 + 追问判断，未来支持 LLM 自动改写问题、多轮检索，直到找到高质量答案
+
+- **动态知识库更新**（Hermes Agent Skill）  
+  Agent 定时爬取政府公开网站的政策更新 → LLM 筛选相关性 → 自动写入知识库，实现知识库"活起来"
+
+- **结合结构化数据分析**  
+  接入 SQLite / 数据库，回答"这个季度趋势如何"、"哪类数据最值得关注"等分析类问题
 
 - **扫码入库 + OCR 识别**  
-  微信拍照进货单 → OCR 识别 → 自动录入商品数据库
+  拍照单据 → OCR 识别 → 自动录入知识库
 
-- **多行业模板**  
-  提供餐饮、零售、美容美发等行业预置知识库模板，用户开箱即用
+- **多行业预设模板**  
+  提供餐饮、零售、医疗、法律等行业预置 preset，开箱即用
 
 ---
 
@@ -637,7 +858,7 @@ sudo apt install tesseract-ocr
 
 ![Hermes调用RAG](screenshots/hermes_rag_1.png)
 
-*Hermes 界面调用 RAG API，回答「个体户如何报税」问题*
+*Hermes 界面调用 RAG API，回答知识库相关问题*
 
 ---
 
@@ -658,7 +879,8 @@ sudo apt install tesseract-ocr
 | **向量数据库** | ChromaDB |
 | **Embedding** | BAAI/bge-small-zh-v1.5 |
 | **Reranker** | BAAI/bge-reranker-v2-m3 |
-| **LLM（在线）** | DeepSeek Chat |
+| **锚点判断** | 字符 n-gram + LSM-Tree 风格缓冲合并 🆕 |
+| **LLM（在线）** | DeepSeek Chat（temperature=0.1） |
 | **LLM（离线）** | Ollama + Qwen2.5:7b |
 | **后端** | FastAPI + Uvicorn |
 | **前端** | Streamlit |
