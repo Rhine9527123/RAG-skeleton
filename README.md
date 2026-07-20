@@ -10,7 +10,9 @@
 
 ---
 
-## 这是什么？
+# 一、产品介绍
+
+## 项目简介
 
 **一个可以"即插即用"的 RAG 系统骨架。**
 
@@ -25,24 +27,81 @@
 
 ## 核心特性
 
-| 特性 | 说明 |
-|------|------|
-| **通用骨架** | 知识库与业务逻辑分离，换领域只需替换知识文件 + 切换预设 |
-| **混合检索** | 向量检索 + BM25 关键词检索，双路并行，不漏答案 |
-| **Reranker 精排** | 对检索结果二次精排，进一步提升准确率 |
-| **锚点判断** 🆕 | 提取用户问题关键词与知识库高频词对比，自动分流 Fast RAG / Agentic RAG |
-| **Agentic RAG 追问** 🆕 | 检索质量不足时主动追问，引导用户换问法，不硬编回答 |
-| **双 LLM 模式** | 有网用 DeepSeek（质量高），断网用 Ollama（本地离线） |
-| **Hermes Agent 集成** | 通过 MCP 协议接入，支持记忆、推理、多轮对话 |
-| **微信直连** | iLink Bot API，扫码登录，无需公网 IP |
-| **多格式支持** | txt / pdf（含表格+嵌入图片OCR）/ xlsx（自动生成行摘要+统计概要） |
-| **完全本地部署** | 数据不出本机，隐私安全 |
+| 特性 | 解决的问题 | 提升的效果 | 采用的方案 |
+|------|-----------|-----------|-----------|
+| **通用骨架** | RAG 系统与业务逻辑耦合，换领域要重写代码 | 换领域只需替换知识文件 + 切换预设 | 知识库与业务逻辑分离，`config.py` 中心化配置 |
+| **混合检索** | 纯向量检索漏掉关键词精确匹配，纯 BM25 不懂语义 | 双路并行，不漏答案 | 向量检索 + BM25 关键词检索，`QueryFusionRetriever` 合并 |
+| **Reranker 精排** | Bi-Encoder 检索精度不够，向量距离 ≠ 语义相关性 | 候选集二次精排，准确率显著提升 | Bi-Encoder 粗筛 + Cross-Encoder 精排（bge-reranker-v2-m3）|
+| **锚点判断** | 每个问题都走相同检索流程，简单问题浪费算力，模糊问题硬编低质量回答 | 自动分流 Fast / Agentic RAG，响应延迟降幅 91% | 字符 n-gram + LSM-Tree 风格缓冲合并 + B-Tree 双层路由 |
+| **强名词评分** | 关键词命中但答非所问，强实体词被通用词稀释信号 | "学校有几个门"从 0.0 → 1.0 完全命中 | 4 层权重体系（strong_noun 1.0 → generic_noun 0.2）+ 三重防误判过滤 |
+| **Agentic RAG 追问** | 检索质量不足时硬编低质量回答 | 主动追问，引导用户换问法 | 双阈值规则（锚点命中数 < 2 且 top_score < 0.3）|
+| **双 LLM 模式** | 断网时无法使用 | 有网用 DeepSeek（质量高），断网用 Ollama（本地离线）| 启动时自动检测 Ollama 可用性，双引擎切换 |
+| **Hermes Agent 集成** | RAG 只能通过 Web 访问，缺乏记忆和推理能力 | 支持记忆、推理、多轮对话，多平台统一调度 | MCP 协议封装，Hermes 作为调度中心 |
+| **微信直连** | 接入微信需要公网 IP 和复杂配置 | 扫码登录，无需公网 IP | iLink Bot API |
+| **多格式支持** | 不同文档格式需要不同解析方式 | txt / pdf（含表格 + OCR）/ xlsx（行摘要 + 统计概要）| LlamaIndex Document 策略 + PyMuPDF + pandas |
+| **完全本地部署** | 数据出本机有隐私风险 | 数据不出本机，隐私安全 | Docker 容器化 + 本地模型 |
 
 ---
 
-## 技术决策
+## 系统架构
 
-### 为什么用 LlamaIndex 而不是 LangChain？
+```
+用户（微信 / 飞书 / Web）
+        ↓
+Hermes Agent（调度中心：记忆 + 推理 + 工作流）
+        ↓  MCP 协议（stdio）
+rag_mcp_server.py（MCP 翻译层）
+        ↓  HTTP (localhost:8000)
+server.py（FastAPI 后端）
+        ↓
+锚点判断（anchor_manager.py）
+    ├─ Fast RAG → 向量检索 + BM25 + Reranker → LLM 生成
+    └─ Agentic RAG → 多角度检索 / 追问用户
+        ↓
+知识库（data/ 目录，支持 txt/pdf/xlsx）
+        ↓
+LLM 层（DeepSeek 在线 temperature=0.1 / Ollama 离线）
+```
+
+---
+
+## 运行截图
+
+### 1. RAG 网页端前端（Streamlit）
+
+![RAG前端主界面](screenshots/rag_web_main.png)
+
+*RAG 网页端前端主界面，用户可在聊天框提问*
+
+---
+
+### 2. RAG 网页端问答效果
+
+![RAG前端问答](screenshots/rag_web_qa.png)
+
+*用户提问后，AI 返回专业回答，并展示答案来源*
+
+---
+
+### 3. Hermes Agent 调用 RAG API
+
+![Hermes调用RAG](screenshots/hermes_rag_1.png)
+
+*Hermes 界面调用 RAG API，回答知识库相关问题*
+
+---
+
+### 4. 微信接入效果
+
+![微信问答](screenshots/wechat_qa_1.jpg)
+
+*微信聊天界面，用户通过 Hermes + RAG 获取专业回答*
+
+---
+
+# 二、技术解析
+
+## 技术选型：为什么用 LlamaIndex 而不是 LangChain
 
 | 对比维度 | LlamaIndex | LangChain |
 |---------|-------------|----------|
@@ -57,7 +116,7 @@
 
 ---
 
-### Chunking 策略：为什么是 256 + 50？
+## Chunking 策略：256 + 50
 
 文本切片（Chunking）是 RAG 的第一步，也是最容易被忽视的一步。切太大，检索噪声多；切太小，语义不完整。
 
@@ -86,7 +145,7 @@ nodes = splitter.get_nodes_from_documents(documents)
 
 ---
 
-### 为什么用 Cross-Encoder（Reranker）而不是只用 Bi-Encoder？
+## 检索精排：Cross-Encoder vs Bi-Encoder
 
 这是 RAG 系统里最关键的技术决策之一。
 
@@ -127,7 +186,7 @@ Bi-Encoder 可能给 B 更高的分数，因为 B 里"增值税"和"10万元"都
 
 ---
 
-### 防幻觉设计：让 AI "有据可依"
+## 防幻觉设计：让 AI "有据可依"
 
 RAG 系统的核心价值就是**减少幻觉**——不让 AI 瞎编。本项目从三个层面实现防幻觉：
 
@@ -162,13 +221,13 @@ API 返回结构中包含 `sources` 字段，每条来源有：
 
 ---
 
-### 锚点判断：Fast RAG vs Agentic RAG 🆕
+## 锚点判断：Fast RAG vs Agentic RAG
 
 传统 RAG 对每个问题都走相同的检索流程——检索、排序、生成，不管问题是否清晰、是否命中知识库领域。这在简单问题上浪费了 Reranker 算力，在模糊问题上又硬编出低质量回答。
 
 **本项目引入锚点判断机制**，通过提取用户问题的关键词、与知识库高频词对比，自动决定走快速检索还是 Agentic 追问。锚点集的更新借鉴了 LSM-Tree 的写入缓冲思路（新文档先进内存缓冲，攒够一批再合并刷盘），避免每次上传都全量重建。
 
-#### 核心思路
+### 核心思路
 
 ```
 用户提问
@@ -182,7 +241,7 @@ API 返回结构中包含 `sources` 字段，每条来源有：
 
 **什么是"锚点"？** 离线扫描知识库所有文档，用字符 n-gram（2~4字滑动窗口）提取高频词，这些高频词就是"锚点"——它们代表了知识库的核心主题。比如一个税务知识库，"纳税人"、"增值税"、"免征"这些词会高频出现，自然成为锚点。用户提问时，如果问题里包含足够多的锚点词，说明问题落在知识库领域内，走 Fast RAG；否则走 Agentic RAG。
 
-#### 方案选型：我的想法 vs AI 建议
+### 方案选型：我的想法 vs AI 建议
 
 在实现这个判断机制时，每个关键环节我都有自己的设计想法，同时也对比了 AI 给出的常规建议。以下是选型对比和决策理由：
 
@@ -219,7 +278,98 @@ API 返回结构中包含 `sources` 字段，每条来源有：
 
 **为什么选双阈值规则？** 锚点命中数本质上回答了一个问题：**"用户的提问跟我的知识库相关吗？"** 如果用户问"今天天气怎么样"，而知识库是税务领域的，锚点命中数会是 0——这个判断不需要 LLM，简单的词匹配就够了。再加上检索 top_score 作为第二道关卡，双重确认后才触发追问，避免误判。不额外调用 LLM 意味着零延迟、零成本，而且规则可解释、可调试。
 
-#### Agentic RAG 追问：不硬编低质量回答
+### 强名词评分体系（4 层权重）
+
+**解决的问题：** 基础锚点命中判断只做"命中数 ≥ 2"的二元分流，但关键词命中不等于答对问题——"学校有几个门"里"学校"是通用名词（权重应低），"门"才是答案核心实体（权重应高），但旧逻辑一视同仁，导致评分 0.0000，被错误追问。
+
+**提升的效果：**
+
+| 查询 | 优化前 | 优化后 | 状态变化 |
+|------|--------|--------|----------|
+| 学校有几个门 | 0.0000 | **1.0000** | 无法回答 → 完全命中 |
+| 校园卡怎么办理 | 0.5273 | **0.6333** | 误跳过 → 歧义精排 |
+| 学校的校门在哪里 | 0.4786 | **0.5899** | 低于阈值 → 越过阈值 |
+| 学校全称是什么 | 0.5128 | **0.6125** | 边缘命中 → 稳定命中 |
+| 食堂在哪里 | - | **0.7167** | 高置信命中 |
+
+**采用的方案：** 按对答案的决定性排序，赋予 4 层权重：
+
+| 类别 | 权重 | 说明 | 示例 |
+|------|------|------|------|
+| strong_noun | 1.0 | 答案核心词 | 校门、食堂、图书馆 |
+| suffix_noun | 0.8 | 名词后缀词 | 心理咨询室、学生事务处 |
+| interrogative | 0.4 | 疑问代词 | 哪里、什么、多少 |
+| generic_noun | 0.2 | 通用名词 | 学校、学生、老师 |
+| weak | 0.05 | 虚词/通用动词 | 的、了、是、有 |
+| other | 0.05-0.2 | 未识别（按长度降权）| 2字0.2 / 3字0.1 / 4字0.05 |
+
+**多重防误判过滤**：后缀规则原本会把"几个门""怎么办"等疑问短语误判为名词（权重 0.8）。新增三重过滤：
+1. 疑问词片段黑名单（几个、多少、怎么...）
+2. 通用动词片段过滤（办理、使用、申请...）
+3. **必须同时存在于锚点集中**才算 suffix_noun
+
+**省略式实体补全**：检测"几个 X""几 X""多少 X"等省略问法，在锚点集中查找以核心字开头/结尾的实体词补全。解决"学校有几个门"的"门"无法匹配"校门/东门"的问题。
+
+**文件：** `keyword_scorer.py`（`classify_token` + `compute_keyword_score`）
+
+### B-Tree 双层锚点路由
+
+**解决的问题：** 逐条扫描锚点集做匹配效率低，且锚点集子串去重逻辑会误删关键短实体（如"东门"被"学校东门"覆盖）。
+
+**提升的效果：** 运行时只需 O(1) 查表锁定候选文档子集，无需扫描全量文档。当前覆盖 217 个锚点词 → 7 篇文档。
+
+**采用的方案：** 借鉴 B-Tree 的分层查找思想，三层架构：
+
+```
+用户提问
+   ↓ Layer 1（粗筛）
+   反向索引：锚点词 → 文档ID列表
+   快速锁定候选文档子集（O(1) 查表）
+   ↓ Layer 2（细查）
+   ngram 提取 + 关键词评分（keyword_score）
+   ↓ Layer 3（融合决策）
+   final_score = 0.6 * top_score + 0.4 * keyword_score
+```
+
+**反向索引构建**：离线扫描锚点集，为每个锚点词建立 `→ 文档ID列表` 映射。
+
+**锚点集强名词注入**：加载锚点集后强制注入 `STRONG_NOUNS` 中 2 字以上的词，防止子串去重逻辑误删关键实体。锚点集从 333 → 369（补充 36 个强名词）。
+
+**文件：** `anchor_manager.py`（`build_anchor_to_docs_index` + `route`）
+
+### Reranker 跳过策略（三信号）
+
+**解决的问题：** 双信号跳过策略（`kw≥0.5 AND ret_top≥0.5`）在多义词场景误判——"校园卡怎么办理"命中跳过条件，但 top1 是电话卡而非一卡通（文档中"校园卡"存在歧义）。
+
+**采用的方案：** 升级为三信号跳过策略：
+
+| 版本 | 跳过条件 | 问题 |
+|------|----------|------|
+| v1 双信号 | `kw≥0.5 AND ret_top≥0.5` | 多义词误跳过 |
+| v2 三信号 | `kw≥0.6 AND ret_top≥0.6 AND gap≥0.05` | 新增 top1-top2 分数差距检测 |
+
+当 top1 和 top2 分数差距 < 0.05 时，说明存在歧义，强制走 reranker 精排。
+
+### 性能优化：响应延迟降幅 91%
+
+**解决的问题：** Reranker 阶段占总延迟 85%（3502ms），用户每次问答等近 9 秒。
+
+**提升的效果：**
+
+| 指标 | 优化前 | 优化后 | 改善 |
+|------|--------|--------|------|
+| 平均响应延迟 | 8472ms | 776ms | **降幅 91%** |
+| Reranker 阶段 | 3502ms | 0ms（跳过时）| 主要瓶颈消除 |
+
+**采用的方案：** 三项优化联合作用：
+
+| 优化项 | 作用 |
+|--------|------|
+| 降低 TOP_K | 减少送入 Reranker 的候选数 |
+| LRU 缓存 | 缓存 rerank 结果，容量 64，重复问法直接命中 |
+| 三信号跳过策略 | 高置信 + 无歧义时跳过 Reranker |
+
+### Agentic RAG 追问：不硬编低质量回答
 
 当用户问题锚点命中不足且检索匹配度低时，系统不会硬编一个低质量回答，而是**主动追问**：
 
@@ -232,9 +382,16 @@ API 返回结构中包含 `sources` 字段，每条来源有：
 - "增值税起征点是多少？"
 ```
 
-主题提示词通过 `get_topic_hints()` 从锚点集提取，**中文优先排序**（CJK 字符检测 + 长度降序），避免显示一堆英文碎片。
+**主题提示词优化：** `get_topic_hints()` 原本直接从锚点集取最长 ngram，返回"生群并通知准"等跨词边界碎片。修复方案：
+1. 优先从预定义核心主题词列表选取（食堂、宿舍、图书馆、校门...）
+2. 与锚点集取交集，确保只返回知识库中实际存在的主题
+3. 补充词过滤虚词开头/结尾的碎片
 
-#### 前端路由可视化
+**效果：**
+- 优化前：`['生群并通知准', '几个门', ...]`（乱码）
+- 优化后：`['食堂','宿舍','图书馆','校门','教学楼','校园卡','一卡通','奖学金','助学金','转专业','医务室','校医院']`
+
+### 前端路由可视化
 
 前端在答案输出**之前**就显示路由徽章，让用户知道走了哪条路径：
 
@@ -246,9 +403,7 @@ API 返回结构中包含 `sources` 字段，每条来源有：
 
 **实现技巧**：在 `st.write_stream` 之前先 `next(gen)` 偷看第一个 token，此时所有前置 SSE 事件（route_info / progress）已被消费，可以提前拿到路由信息并渲染徽章。
 
-**关键文件：** `anchor_manager.py`（~370行），核心类 `AnchorSetManager`。
-
-#### 效果演示
+### 效果演示
 
 以下截图展示了锚点判断机制在真实场景中的表现（知识库为税务领域）：
 
@@ -280,19 +435,26 @@ API 返回结构中包含 `sources` 字段，每条来源有：
 
 ![来源资料详情](screenshots/source_detail_expanded.png)
 
+### 问题修复清单
+
+| 问题 | 根因 | 修复方案 |
+|------|------|----------|
+| "学校有几个门"被错误追问 | 锚点集缺失"校门/东门"等短词 + 单字无法 ngram | 强名词注入 + 省略式实体补全 |
+| "校园卡怎么办理"答非所问 | 多义词误跳过 Reranker | 三信号跳过策略（新增 gap 检测）|
+| 主题提示词乱码 | 直接取锚点集最长 ngram | 预定义主题词列表 + 锚点集交集 |
+| 后缀规则误判疑问短语 | 仅按结尾字符判断 | 三重过滤（黑名单 + 动词过滤 + 锚点集验证）|
+| 响应延迟过高 | Reranker 占 85% | LRU 缓存 + 三信号跳过策略 |
+| 启动 emoji 崩溃 | Windows GBK 编码 | 改用 `logger.info()` |
+
+**关键文件：** `anchor_manager.py`（~370行）、`keyword_scorer.py`
+
 ---
 
-## FastAPI 如何解决「模型加载慢」的问题？
+## 模型加载优化：FastAPI lifespan 机制
 
-**问题根源：**
+**解决的问题：** Embedding 模型（bge-small-zh-v1.5，~130MB）和 Reranker 模型（bge-reranker-v2-m3，~2.1GB）每次 Python 进程启动都要重新加载，耗时约 **31 秒**，用户每问一次等半天。
 
-Embedding 模型（bge-small-zh-v1.5，~130MB）和 Reranker 模型（bge-reranker-v2-m3，~2.1GB）每次 Python 进程启动都要重新加载，耗时约 **31 秒**，用户每问一次等半天。
-
-**解决思路：**
-
-把模型加载放到**进程启动时做一次**，之后所有请求复用同一份内存。
-
-**FastAPI 的 `lifespan` 机制：**
+**采用的方案：** 把模型加载放到**进程启动时做一次**，之后所有请求复用同一份内存。
 
 ```python
 @asynccontextmanager
@@ -319,7 +481,7 @@ async def lifespan(app: FastAPI):
 
 ---
 
-## Hermes Agent 如何判断「什么时候用 RAG」？
+## Hermes Agent 调度机制
 
 Hermes 本身是一个 **LLM Agent 调度框架**，它不会硬编码「什么时候调 RAG」，而是让 **LLM 自己判断**。
 
@@ -368,136 +530,9 @@ LLM 根据 `description` 自动判断**什么时候该调这个工具**。
 
 ---
 
-## 当前测试状态
+# 三、使用指南
 
-为验证通用性，当前知识库已覆盖**三个差异较大的领域**，均测试通过：
-
-| 知识库内容 | 文件类型 | 测试目的 |
-|-------------|----------|----------|
-| 政策条文（示例知识） | txt | 验证政策类文本问答准确性 |
-| 结构化数据报告（含表格 PDF） | pdf | 验证 PDF 表格 + 文本混合解析 |
-| 业务流水数据（销售记录） | xlsx | 验证结构化数据的行摘要 + 统计概要 |
-
-**结论：** 同一套骨架，换知识库 + 切预设，问答质量取决于知识文件质量。
-
----
-
-## 多平台接入
-
-基于 **Hermes Agent** 作为统一调度中心，同一套 RAG 能力可同时接入多个平台：
-
-| 平台 | 接入方式 | 状态 |
-|------|----------|------|
-| Web（浏览器） | Streamlit 前端，直接访问 localhost:8501 | ✅ 已完成 |
-| 微信 | iLink Bot API，扫码登录，无需公网 IP | ✅ 已完成 |
-| 飞书 | Hermes 原生支持，配置即用 | ✅ 已完成 |
-| WhatsApp | Hermes 支持，需配置 | 待接入 |
-
-接入方式统一通过 **MCP 协议**，RAG 侧无需任何修改。
-
----
-
-## 系统架构
-
-```
-用户（微信 / 飞书 / Web）
-        ↓
-Hermes Agent（调度中心：记忆 + 推理 + 工作流）
-        ↓  MCP 协议（stdio）
-rag_mcp_server.py（MCP 翻译层）
-        ↓  HTTP (localhost:8000)
-server.py（FastAPI 后端）
-        ↓
-锚点判断（anchor_manager.py）
-    ├─ Fast RAG → 向量检索 + BM25 + Reranker → LLM 生成
-    └─ Agentic RAG → 多角度检索 / 追问用户
-        ↓
-知识库（data/ 目录，支持 txt/pdf/xlsx）
-        ↓
-LLM 层（DeepSeek 在线 temperature=0.1 / Ollama 离线）
-```
-
----
-
-## 项目结构
-
-```
-RAG-Skeleton/                # 项目根目录
-├── server.py                # FastAPI 后端（RAG 服务核心 + 路由分发）
-├── web.py                   # Streamlit 前端界面（路由徽章 + 引用展示）
-├── anchor_manager.py        # 锚点判断管理器（LSM-Tree 风格）🆕
-├── rag_mcp_server.py        # MCP Server 封装（供 Hermes 调用）
-├── 启动.bat                 # Windows 一键启动脚本
-├── config.py                # 中心化配置（领域切换入口）
-├── requirements.txt         # Python 依赖清单
-├── cleaner.py               # 内容清洗管线
-├── crawler.py               # 多源内容爬虫
-├── pipeline.py              # 知识库更新流水线
-├── dedup.py                 # 去重模块
-├── demo/                    # 示例/教程文件（参考学习用）
-│   ├── app_single.py
-│   ├── config_ui.py
-│   └── day*.py
-├── data/                    # 知识库原始文件（丢文件到这里即可）
-│   ├── metadata.json        # 元数据标签映射（可选）
-│   └── ...                  # 你的知识文件
-├── chroma_data_server/      # 向量索引持久化（自动生成）
-└── models/                  # 本地模型缓存（自动下载）
-    └── BAAI/
-        ├── bge-small-zh-v1.5/
-        └── bge-reranker-v2-m3/
-```
-
-## 🆕 领域切换（v0.2.0 新增）
-
-所有领域相关的字符串（提示词、界面文字、关键词等）集中在 `config.py` 中管理。
-
-### 方式一：环境变量（最简单）
-
-```bash
-# 设为 finance（财经）— 使用内置预设
-set RAG_DOMAIN=finance
-
-# 或 medical（医疗）
-set RAG_DOMAIN=medical
-
-# 或 legal（法律）
-set RAG_DOMAIN=legal
-
-# 或完全自定义任何参数
-set RAG_APP_NAME=我的知识库
-set RAG_SYSTEM_PROMPT=你是XX领域的专家...
-```
-
-### 方式二：修改 config.py 预设
-
-编辑 `config.py`，在 `DOMAIN_PRESETS` 中添加自己的预设，或修改现有预设。
-
-```python
-DOMAIN_PRESETS = {
-    "my_domain": {
-        "app_name": "我的领域助手",
-        "system_prompt": "你是...",
-        "domain_keywords": ["关键词1", "关键词2"],
-        # ... 其他配置
-    },
-}
-```
-
-### 元数据标签（data/metadata.json）
-
-可以在 `data/metadata.json` 中为每个知识文件指定分类标签和来源：
-
-```json
-{
-  "tax_policy.txt": {"category": "政策法规", "source": "政府网站"},
-  "health_guide.pdf": {"category": "医疗健康", "source": "卫健委"}
-}
-```
-
----
-
-## 环境配置（详细版）
+## 环境配置
 
 ### 第一步：安装 Python
 
@@ -557,7 +592,7 @@ pip install -r requirements.txt
 | `pymupdf` | PDF 解析 |
 | `pandas` / `openpyxl` | Excel 解析 |
 | `chromadb` | 向量数据库 |
-| `python-dotenv` | .env 文件加载 🆕 |
+| `python-dotenv` | .env 文件加载 |
 
 ### 第六步：配置 API Key
 
@@ -633,7 +668,7 @@ streamlit run web.py --server.port 8501
 
 ---
 
-## 如何使用（换领域只需 3 步）
+## 领域切换（换领域只需 3 步）
 
 ### 第 1 步：清空旧知识库
 
@@ -669,6 +704,54 @@ python server.py
 ```
 
 启动时会自动重新构建索引 + 锚点集，完成后即可对话。
+
+### 领域预设配置
+
+所有领域相关的字符串（提示词、界面文字、关键词等）集中在 `config.py` 中管理。
+
+**方式一：环境变量（最简单）**
+
+```bash
+# 设为 finance（财经）— 使用内置预设
+set RAG_DOMAIN=finance
+
+# 或 medical（医疗）
+set RAG_DOMAIN=medical
+
+# 或 legal（法律）
+set RAG_DOMAIN=legal
+
+# 或完全自定义任何参数
+set RAG_APP_NAME=我的知识库
+set RAG_SYSTEM_PROMPT=你是XX领域的专家...
+```
+
+**方式二：修改 config.py 预设**
+
+编辑 `config.py`，在 `DOMAIN_PRESETS` 中添加自己的预设，或修改现有预设。
+
+```python
+DOMAIN_PRESETS = {
+    "my_domain": {
+        "app_name": "我的领域助手",
+        "system_prompt": "你是...",
+        "domain_keywords": ["关键词1", "关键词2"],
+        # ... 其他配置
+    },
+}
+```
+
+### 元数据标签（data/metadata.json）
+
+可以在 `data/metadata.json` 中为每个知识文件指定分类标签和来源：
+
+```json
+{
+  "tax_policy.txt": {"category": "政策法规", "source": "政府网站"},
+  "health_guide.pdf": {"category": "医疗健康", "source": "卫健委"}
+}
+```
+
 ---
 
 ## API 文档
@@ -727,7 +810,50 @@ curl -X POST http://localhost:8000/chat \
 
 ---
 
-## 接入 Hermes Agent（可选）
+## 常见问题
+
+### Q：启动时报 `Error: Incorrect API key provided`
+
+**原因：** DeepSeek API Key 未配置或配置错误。
+
+**解决：**
+- 检查 `.env` 文件中 `DEEPSEEK_API_KEY` 是否正确
+- 或设置环境变量 `DEEPSEEK_API_KEY`
+
+### Q：Ollama 模式报 `resource module not available on Windows`
+
+**原因：** Python 版本问题，不影响使用，可忽略。
+
+### Q：PDF 解析结果为空
+
+**原因：** 可能是扫描件，已内置 OCR 兜底，需安装 Tesseract：
+
+```bash
+# Windows
+winget install Tesseract-OCR
+
+# macOS
+brew install tesseract
+
+# Ubuntu
+sudo apt install tesseract-ocr
+```
+
+### Q：如何确认 RAG 在正常工作？
+
+访问 `http://localhost:8000/docs`，用 `/chat` 接口测试，观察返回的 `sources` 字段是否有内容。同时检查 `route_info.route` 是否为 `"fast"`（命中锚点）或 `"agentic"`（未命中）。
+
+### Q：为什么有时候 AI 不直接回答而是追问？
+
+**原因：** Agentic RAG 追问机制触发。当用户问题命中的锚点不足且检索匹配度低于 0.3 时，系统判定问题与知识库领域不匹配或过于模糊，主动追问引导用户换问法，而不是硬编低质量回答。
+
+**解决：** 按追问提示的主题词重新组织问题，或向知识库上传更多相关文档。
+
+---
+
+# 四、扩展接入
+
+## Hermes Agent 集成
 
 Hermes Agent 让你通过**微信 / 飞书**调用这个 RAG 系统，并具备记忆和推理能力。
 
@@ -762,7 +888,7 @@ hermes restart
 
 ---
 
-## 接入微信（可选）
+## 微信接入
 
 1. Hermes 安装完成后，配置 **iLink Bot**（个人微信接入）
 2. 扫码登录，无需公网 IP
@@ -770,44 +896,86 @@ hermes restart
 
 ---
 
-## 常见问题
+## 多平台支持
 
-### Q：启动时报 `Error: Incorrect API key provided`
+基于 **Hermes Agent** 作为统一调度中心，同一套 RAG 能力可同时接入多个平台：
 
-**原因：** DeepSeek API Key 未配置或配置错误。
+| 平台 | 接入方式 | 状态 |
+|------|----------|------|
+| Web（浏览器） | Streamlit 前端，直接访问 localhost:8501 | ✅ 已完成 |
+| 微信 | iLink Bot API，扫码登录，无需公网 IP | ✅ 已完成 |
+| 飞书 | Hermes 原生支持，配置即用 | ✅ 已完成 |
+| WhatsApp | Hermes 支持，需配置 | 待接入 |
 
-**解决：**
-- 检查 `.env` 文件中 `DEEPSEEK_API_KEY` 是否正确
-- 或设置环境变量 `DEEPSEEK_API_KEY`
+接入方式统一通过 **MCP 协议**，RAG 侧无需任何修改。
 
-### Q：Ollama 模式报 `resource module not available on Windows`
+---
 
-**原因：** Python 版本问题，不影响使用，可忽略。
+# 五、附录
 
-### Q：PDF 解析结果为空
+## 项目结构
 
-**原因：** 可能是扫描件，已内置 OCR 兜底，需安装 Tesseract：
-
-```bash
-# Windows
-winget install Tesseract-OCR
-
-# macOS
-brew install tesseract
-
-# Ubuntu
-sudo apt install tesseract-ocr
+```
+RAG-Skeleton/                # 项目根目录
+├── server.py                # FastAPI 后端（RAG 服务核心 + 路由分发）
+├── web.py                   # Streamlit 前端界面（路由徽章 + 引用展示）
+├── anchor_manager.py        # 锚点判断管理器（LSM-Tree 风格）
+├── keyword_scorer.py        # 强名词评分体系（4 层权重）
+├── rag_mcp_server.py        # MCP Server 封装（供 Hermes 调用）
+├── 启动.bat                 # Windows 一键启动脚本
+├── config.py                # 中心化配置（领域切换入口）
+├── requirements.txt         # Python 依赖清单
+├── cleaner.py               # 内容清洗管线
+├── crawler.py               # 多源内容爬虫
+├── pipeline.py              # 知识库更新流水线
+├── dedup.py                 # 去重模块
+├── demo/                    # 示例/教程文件（参考学习用）
+│   ├── app_single.py
+│   ├── config_ui.py
+│   └── day*.py
+├── data/                    # 知识库原始文件（丢文件到这里即可）
+│   ├── metadata.json        # 元数据标签映射（可选）
+│   └── ...                  # 你的知识文件
+├── chroma_data_server/      # 向量索引持久化（自动生成）
+└── models/                  # 本地模型缓存（自动下载）
+    └── BAAI/
+        ├── bge-small-zh-v1.5/
+        └── bge-reranker-v2-m3/
 ```
 
-### Q：如何确认 RAG 在正常工作？
+---
 
-访问 `http://localhost:8000/docs`，用 `/chat` 接口测试，观察返回的 `sources` 字段是否有内容。同时检查 `route_info.route` 是否为 `"fast"`（命中锚点）或 `"agentic"`（未命中）。
+## 当前测试状态
 
-### Q：为什么有时候 AI 不直接回答而是追问？ 🆕
+为验证通用性，当前知识库已覆盖**三个差异较大的领域**，均测试通过：
 
-**原因：** Agentic RAG 追问机制触发。当用户问题命中的锚点不足且检索匹配度低于 0.3 时，系统判定问题与知识库领域不匹配或过于模糊，主动追问引导用户换问法，而不是硬编低质量回答。
+| 知识库内容 | 文件类型 | 测试目的 |
+|-------------|----------|----------|
+| 政策条文（示例知识） | txt | 验证政策类文本问答准确性 |
+| 结构化数据报告（含表格 PDF） | pdf | 验证 PDF 表格 + 文本混合解析 |
+| 业务流水数据（销售记录） | xlsx | 验证结构化数据的行摘要 + 统计概要 |
 
-**解决：** 按追问提示的主题词重新组织问题，或向知识库上传更多相关文档。
+**结论：** 同一套骨架，换知识库 + 切预设，问答质量取决于知识文件质量。
+
+---
+
+## 技术栈
+
+| 层级 | 技术 |
+|------|------|
+| **Agent 框架** | Hermes Agent（记忆 + 推理 + MCP） |
+| **RAG 框架** | LlamaIndex 0.14.x |
+| **向量数据库** | ChromaDB |
+| **Embedding** | BAAI/bge-small-zh-v1.5 |
+| **Reranker** | BAAI/bge-reranker-v2-m3 |
+| **锚点判断** | 字符 n-gram + LSM-Tree 风格缓冲合并 + B-Tree 双层路由 |
+| **强名词评分** | 4 层权重体系（strong_noun → generic_noun） |
+| **LLM（在线）** | DeepSeek Chat（temperature=0.1） |
+| **LLM（离线）** | Ollama + Qwen2.5:7b |
+| **后端** | FastAPI + Uvicorn |
+| **前端** | Streamlit |
+| **通信协议** | MCP（Model Context Protocol） |
+| **微信接入** | iLink Bot API |
 
 ---
 
@@ -818,6 +986,9 @@ sudo apt install tesseract-ocr
 
 - ~~**锚点判断机制**~~ ✅ 已完成
   LSM-Tree 风格锚点管理 + Fast/Agentic RAG 双路分流 + 追问机制
+
+- ~~**强名词评分 + B-Tree 双层路由**~~ ✅ 已完成
+  4 层权重体系 + 反向索引 + 三信号跳过策略 + 主题提示词优化
 
 - **Agentic RAG 多轮改写检索**  
   当前 Agentic 路径仅做单次检索 + 追问判断，未来支持 LLM 自动改写问题、多轮检索，直到找到高质量答案
@@ -833,59 +1004,6 @@ sudo apt install tesseract-ocr
 
 - **多行业预设模板**  
   提供餐饮、零售、医疗、法律等行业预置 preset，开箱即用
-
----
-
-## 运行截图
-
-### 1. RAG 网页端前端（Streamlit）
-
-![RAG前端主界面](screenshots/rag_web_main.png)
-
-*RAG 网页端前端主界面，用户可在聊天框提问*
-
----
-
-### 2. RAG 网页端问答效果
-
-![RAG前端问答](screenshots/rag_web_qa.png)
-
-*用户提问后，AI 返回专业回答，并展示答案来源*
-
----
-
-### 3. Hermes Agent 调用 RAG API
-
-![Hermes调用RAG](screenshots/hermes_rag_1.png)
-
-*Hermes 界面调用 RAG API，回答知识库相关问题*
-
----
-
-### 4. 微信接入效果
-
-![微信问答](screenshots/wechat_qa_1.jpg)
-
-*微信聊天界面，用户通过 Hermes + RAG 获取专业回答*
-
----
-
-## 技术栈一览
-
-| 层级 | 技术 |
-|------|------|
-| **Agent 框架** | Hermes Agent（记忆 + 推理 + MCP） |
-| **RAG 框架** | LlamaIndex 0.14.x |
-| **向量数据库** | ChromaDB |
-| **Embedding** | BAAI/bge-small-zh-v1.5 |
-| **Reranker** | BAAI/bge-reranker-v2-m3 |
-| **锚点判断** | 字符 n-gram + LSM-Tree 风格缓冲合并 🆕 |
-| **LLM（在线）** | DeepSeek Chat（temperature=0.1） |
-| **LLM（离线）** | Ollama + Qwen2.5:7b |
-| **后端** | FastAPI + Uvicorn |
-| **前端** | Streamlit |
-| **通信协议** | MCP（Model Context Protocol） |
-| **微信接入** | iLink Bot API |
 
 ---
 
