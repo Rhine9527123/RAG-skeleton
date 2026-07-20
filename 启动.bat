@@ -2,6 +2,8 @@
 setlocal enabledelayedexpansion
 chcp 65001 >nul
 cd /d "%~dp0"
+:: 确保使用系统 Python（优先于 WorkBuddy Python）
+set "PATH=%LOCALAPPDATA%\Programs\Python\Python313;%PATH%"
 set USERNAME=User
 
 echo ============================================================

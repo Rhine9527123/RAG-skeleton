@@ -51,3 +51,15 @@ backups/
 
 # 草稿文件
 README_v0.3_draft.md
+
+# 调试/临时脚本
+_*.py
+.trash/
+
+# 去重数据库（运行时生成）
+dedup.db
+dedup.db-shm
+dedup.db-wal
+
+# 已废弃功能
+multimodal.py

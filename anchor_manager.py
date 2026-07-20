@@ -229,26 +229,42 @@ class AnchorSetManager:
     def get_topic_hints(self, top_n: int = 8) -> List[str]:
         """
         返回知识库的主题提示词（用于 Agentic RAG 追问）。
-        优先返回包含中文的锚点（更有语义意义），按长度降序排列。
+        优先从强名词列表中选取有语义的实体词，而不是 ngram 碎片。
         """
+        # 优先返回强名词列表中的核心实体词（用户真正会问的主题）
+        _CORE_TOPICS = [
+            "食堂", "宿舍", "图书馆", "校门", "教学楼",
+            "校园卡", "一卡通", "奖学金", "助学金", "转专业",
+            "医务室", "校医院", "警务处", "保卫处", "教务处",
+            "选课", "考试", "成绩", "学费", "入学",
+            "毕业", "新生报到", "电费", "医保", "体育馆",
+            "运动场", "社团", "校招", "专升本", "保研",
+            "查寝", "考勤", "请假", "挂科", "补考",
+            "快递", "外卖", "校园网", "宽带", "游泳馆",
+        ]
+        # 与锚点集取交集，确保只返回知识库中实际存在的主题
         combined = self.anchor_set | {
             w for w, _ in self.pending_counter.most_common(self.pending_top_n)
         }
-        # 优先中文锚点（含 CJK 字符），按长度降序
-        def _is_cjk(s):
-            return any('\u4e00' <= ch <= '\u9fff' for ch in s)
-
-        cjk_words = [w for w in combined if _is_cjk(w)]
-        other_words = [w for w in combined if not _is_cjk(w)]
-
-        cjk_words.sort(key=len, reverse=True)
-        other_words.sort(key=len, reverse=True)
-
-        # 中文优先，英文补充
-        result = cjk_words[:top_n]
-        if len(result) < top_n:
-            result.extend(other_words[:top_n - len(result)])
-        return result
+        result = [w for w in _CORE_TOPICS if w in combined]
+        # 补充一些锚点集中的强名词（3-4字的中文词，不是ngram碎片）
+        for w in sorted(combined, key=len, reverse=True):
+            if len(result) >= top_n:
+                break
+            if w in result:
+                continue
+            # 过滤掉明显的ngram碎片（包含标点位置的、以虚词开头/结尾的）
+            if len(w) < 2 or len(w) > 4:
+                continue
+            if not all('\u4e00' <= ch <= '\u9fff' for ch in w):
+                continue
+            # 过滤以常见虚词开头/结尾的碎片
+            if w[0] in ("的","了","是","有","在","和","与","或","但","如","以","从","到","为","对"):
+                continue
+            if w[-1] in ("的","了","是","有","在","和","与","或","但","如","以","从","到","为","对","不","也","都"):
+                continue
+            result.append(w)
+        return result[:top_n]
     
     # ── 获取统计信息 ──
     
@@ -364,6 +380,17 @@ class AnchorSetManager:
             pending_words = data.get("pending_top_words", [])
             if pending_words:
                 self.pending_counter.update({w: 1 for w in pending_words})
+            
+            # 强制注入强名词：STRONG_NOUNS 中 2字以上的词必须在锚点集中
+            # 防止子串去重误删关键实体（如"东门"被"学校东门"覆盖而删除）
+            from keyword_scorer import STRONG_NOUNS
+            _added = 0
+            for w in STRONG_NOUNS:
+                if len(w) >= 2 and w not in self.anchor_set:
+                    self.anchor_set.add(w)
+                    _added += 1
+            if _added > 0:
+                logger.info(f"[AnchorSet] 补充强名词 {_added} 个到锚点集")
             
             logger.info(
                 f"[AnchorSet] 加载: {len(self.anchor_set)} 锚点, "

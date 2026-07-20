@@ -69,6 +69,7 @@ import scheduler as _scheduler_mod
 
 # ── 锚点集路由（LSM-Tree 风格）──
 from anchor_manager import AnchorSetManager, create_anchor_manager
+from keyword_scorer import compute_keyword_score, build_anchor_to_docs_index, coarse_filter
 
 
 def load_config():
@@ -140,8 +141,113 @@ from llama_index.core.retrievers import QueryFusionRetriever
 from llama_index.llms.openai_like import OpenAILike
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.core.postprocessor import SentenceTransformerRerank
+from llama_index.core.base.embeddings.base import BaseEmbedding
+from pydantic import PrivateAttr
 from llama_index.retrievers.bm25 import BM25Retriever
 from llama_index.core.llms import ChatMessage
+
+
+# ============================================================
+# ONNX Embedding 模型（CPU 推理加速 2-3 倍）
+# ============================================================
+class OnnxEmbedding(BaseEmbedding):
+    """使用 ONNX Runtime 加速的 Embedding 模型。
+
+    与 llama-index 的 BaseEmbedding 接口兼容，可直接赋值给 Settings.embed_model。
+    若 ONNX 模型不存在，会自动回退到 HuggingFaceEmbedding（PyTorch 后端）。
+    """
+
+    model_name: str = "BAAI/bge-small-zh-v1.5"
+    _tokenizer: object = PrivateAttr(default=None)
+    _model: object = PrivateAttr(default=None)
+    _backend: object = PrivateAttr(default=None)  # 实际的 embedding 后端
+    _fallback: object = PrivateAttr(default=None)
+
+    def __init__(self, model_name: str = "BAAI/bge-small-zh-v1.5", **kwargs):
+        super().__init__(model_name=model_name, **kwargs)
+        import os, torch
+        from transformers import AutoTokenizer
+        try:
+            from optimum.onnxruntime import ORTModelForFeatureExtraction
+        except ImportError:
+            print("[ONNX] optimum 未安装，回退到 PyTorch 后端")
+            self._fallback = HuggingFaceEmbedding(model_name=model_name)
+            return
+
+        # Windows 不支持创建符号链接，使用 local_dir 模式直接下载文件（无 symlink）
+        cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "onnx_embedding")
+        os.makedirs(cache_dir, exist_ok=True)
+        local_dir = os.path.join(cache_dir, model_name.replace("/", "_"))
+
+        try:
+            if not os.path.exists(local_dir) or not os.path.exists(os.path.join(local_dir, "model.onnx")):
+                print(f"[ONNX] 首次使用，正在导出 ONNX 模型到: {local_dir}")
+                # 先用 snapshot_download 的 local_dir 模式下载原模型（避免 symlink）
+                from huggingface_hub import snapshot_download
+                tmp_dir = local_dir + "_raw"
+                os.makedirs(tmp_dir, exist_ok=True)
+                snapshot_download(
+                    repo_id=model_name,
+                    local_dir=tmp_dir,
+                    local_dir_use_symlinks=False,  # Windows 关键：禁用 symlink
+                )
+                # 从本地目录导出 ONNX
+                self._model = ORTModelForFeatureExtraction.from_pretrained(
+                    tmp_dir, export=True, provider="CPUExecutionProvider"
+                )
+                self._model.save_pretrained(local_dir)
+                # 保存 tokenizer
+                self._tokenizer = AutoTokenizer.from_pretrained(tmp_dir)
+                self._tokenizer.save_pretrained(local_dir)
+                # 清理临时目录
+                import shutil
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            else:
+                print(f"[ONNX] 加载已缓存的 ONNX 模型: {local_dir}")
+                self._model = ORTModelForFeatureExtraction.from_pretrained(
+                    local_dir, provider="CPUExecutionProvider"
+                )
+                self._tokenizer = AutoTokenizer.from_pretrained(local_dir)
+            print("[ONNX] 模型加载成功")
+        except Exception as e:
+            print(f"[ONNX] 加载失败: {e}，回退到 PyTorch 后端")
+            self._fallback = HuggingFaceEmbedding(model_name=model_name)
+
+    def _get_query_embedding(self, query: str):
+        if self._fallback is not None:
+            return self._fallback.get_query_embedding(query)
+        return self._embed(query)
+
+    def _get_text_embedding(self, text: str):
+        if self._fallback is not None:
+            return self._fallback.get_text_embedding(text)
+        return self._embed(text)
+
+    async def _aget_query_embedding(self, query: str, **kwargs):
+        return self._get_query_embedding(query)
+
+    async def _aget_text_embedding(self, text: str, **kwargs):
+        return self._get_text_embedding(text)
+
+    def _get_text_embeddings(self, texts: list):
+        if self._fallback is not None:
+            return self._fallback.get_text_embeddings(texts)
+        return [self._embed(t) for t in texts]
+
+    def _embed(self, text: str):
+        """生成单个文本的 embedding 向量。"""
+        import torch
+        inputs = self._tokenizer(text, return_tensors="pt", truncation=True, max_length=512, padding=True)
+        outputs = self._model(**inputs)
+        # bge-small 使用 CLS token 的 embedding
+        embedding = outputs.last_hidden_state[:, 0, :]
+        # L2 归一化（bge 推荐做法）
+        embedding = torch.nn.functional.normalize(embedding, p=2, dim=1)
+        return embedding[0].tolist()
+
+    def _async_query_embedding(self, query: str, **kwargs):
+        return self._get_query_embedding(query)
+
 
 # ============================================================
 # PDF 解析依赖
@@ -210,13 +316,36 @@ session_store: "SessionStore" = None  # 多轮对话会话存储
 splitter = None  # 文本切分器
 index = None  # 向量索引
 anchor_mgr: "AnchorSetManager" = None  # 锚点集路由管理器
+anchor_inverted_index: dict = {}  # 锚点→文档反向索引（B-Tree Layer 1 粗筛）
+all_documents_meta: list = []  # 所有文档的元信息（id, text），用于构建反向索引
+
+# ── Reranker LRU 缓存（避免相同 query+docs 重复跑 cross-encoder）──
+from collections import OrderedDict
+_RERANK_CACHE_MAX = 64  # 最多缓存 64 个 query+docs 组合
+_rerank_cache: "OrderedDict" = OrderedDict()
+
+
+def _rerank_cache_get(key):
+    """获取缓存的 rerank 结果，命中则移到队尾（LRU）"""
+    if key in _rerank_cache:
+        _rerank_cache.move_to_end(key)
+        return _rerank_cache[key]
+    return None
+
+
+def _rerank_cache_set(key, value):
+    """写入缓存，超出上限则淘汰队首（最久未用）"""
+    _rerank_cache[key] = value
+    _rerank_cache.move_to_end(key)
+    while len(_rerank_cache) > _RERANK_CACHE_MAX:
+        _rerank_cache.popitem(last=False)
 
 # 配置
 DATA_DIR = "data"
 VECTOR_INDEX_DIR = "chroma_data_server"
 CHUNK_SIZE = 256
 CHUNK_OVERLAP = 50
-TOP_K = 10  # 粗筛数量
+TOP_K = 3  # 粗筛数量（reranker 输入，减小以降低 CPU 推理延迟）
 TOP_N = 3  # 精排数量
 BM25_PERSIST_DIR = "bm25_index"  # BM25 增量索引持久化目录
 BM25_MERGE_THRESHOLD = 100  # Delta 节点数达到此值自动合并
@@ -483,8 +612,49 @@ async def lifespan(app: FastAPI):
 
     # ---- 1. 加载 Embedding 模型 ----
     print("[1/6] 加载 Embedding 模型...")
-    Settings.embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-zh-v1.5")
+    # ONNX 后端默认关闭：与 PyTorch 输出有微小数值差异，会导致旧索引匹配度下降
+    # 若要启用，设置环境变量 USE_ONNX_EMBED=true（需同时删除 chroma_data_server 重建索引）
+    use_onnx = os.environ.get("USE_ONNX_EMBED", "false").lower() in ("true", "1", "yes")
+
+    # Windows 不支持 HuggingFace Hub 的 symlink 缓存机制，优先从本地目录加载模型
+    # 若本地已缓存完整模型文件，直接用本地路径；否则用 snapshot_download 下载到本地（禁用 symlink）
+    _model_id = "BAAI/bge-small-zh-v1.5"
+    _local_model_dir = os.path.join(
+        os.path.expanduser("~"), ".cache", "onnx_embedding", "BAAI_bge-small-zh-v1.5_pytorch"
+    )
+
+    def _ensure_local_model(model_id: str, local_dir: str) -> str:
+        """确保本地有完整的模型文件，返回本地路径。Windows 兼容版。"""
+        # 检查是否已有完整文件（config.json + safetensors + tokenizer）
+        required_files = ["config.json", "model.safetensors", "tokenizer.json", "vocab.txt"]
+        if all(os.path.exists(os.path.join(local_dir, f)) for f in required_files):
+            return local_dir
+        # 用 snapshot_download 的 local_dir 模式下载（不用 symlink）
+        from huggingface_hub import snapshot_download
+        os.makedirs(local_dir, exist_ok=True)
+        print(f"       [INFO] 下载模型到本地（Windows 兼容模式）: {local_dir}")
+        snapshot_download(repo_id=model_id, local_dir=local_dir)
+        return local_dir
+
+    if use_onnx:
+        Settings.embed_model = OnnxEmbedding(model_name=_model_id)
+    else:
+        try:
+            _local_path = _ensure_local_model(_model_id, _local_model_dir)
+            print(f"       [INFO] 从本地路径加载 PyTorch 模型: {_local_path}")
+            Settings.embed_model = HuggingFaceEmbedding(model_name=_local_path)
+        except Exception as e:
+            print(f"       [WARN] 本地加载失败，回退到模型名: {e}")
+            Settings.embed_model = HuggingFaceEmbedding(model_name=_model_id)
     print("       [OK] Embedding 模型加载完成")
+
+    # ---- 1.5 预热 Embedding 模型（避免首次请求冷启动延迟）----
+    try:
+        print("[1.5/6] 预热 Embedding 模型...")
+        _ = Settings.embed_model.get_text_embedding("预热测试")
+        print("        [OK] Embedding 预热完成")
+    except Exception as e:
+        print(f"        [WARN] 预热失败（不影响使用）: {e}")
 
     # ---- 2. 接入 LLM（自动检测：Ollama 可用就用 Ollama，否则用 Kimi）----
     use_ollama = os.environ.get("USE_OLLAMA", "false").lower() in ("true", "1", "yes")
@@ -575,6 +745,18 @@ async def lifespan(app: FastAPI):
     print(f"       [OK] 锚点集就绪（{mgr_stats['anchor_count']} 个锚点, "
           f"来自 {mgr_stats['total_docs_scanned']} 篇文档）")
 
+    # ---- 5b. 构建锚点→文档反向索引（B-Tree Layer 1 粗筛）----
+    global anchor_inverted_index, all_documents_meta
+    print("[5b/7] 构建锚点反向索引（B-Tree Layer 1）...")
+    all_documents_meta = [
+        {"id": doc.metadata.get("file_name", f"doc_{i}"), "text": doc.text}
+        for i, doc in enumerate(documents) if doc.text and doc.text.strip()
+    ]
+    anchor_inverted_index = build_anchor_to_docs_index(
+        all_documents_meta, anchor_mgr.anchor_set
+    )
+    print(f"       [OK] 反向索引就绪（{len(anchor_inverted_index)} 个锚点词 → 文档映射）")
+
     # ---- 6. 组装查询引擎 ----
     print("[6/7] 组装查询引擎...")
     from bm25_store import BM25StoreRetrieverAdapter
@@ -594,6 +776,20 @@ async def lifespan(app: FastAPI):
         session_store = None
         print("       [跳过] 多轮对话已禁用")
 
+    # ---- 6c. 预热 Reranker（避免首次请求冷启动延迟）----
+    try:
+        print("[6c/7] 预热 Reranker 模型...")
+        pps = getattr(query_engine, "_node_postprocessors", []) or []
+        from llama_index.core import QueryBundle
+        from llama_index.core.schema import TextNode, NodeWithScore
+        warmup_nodes = [NodeWithScore(node=TextNode(text="预热测试文本"), score=0.5)]
+        for pp in pps:
+            if hasattr(pp, "postprocess_nodes"):
+                pp.postprocess_nodes(warmup_nodes, QueryBundle("预热测试"))
+        print(f"        [OK] Reranker 预热完成（{len(pps)} 个后处理器）")
+    except Exception as e:
+        print(f"        [WARN] Reranker 预热失败（不影响使用）: {e}")
+
     # ---- 7. 启动完成 ----
     print("[7/7] 服务启动完成！")
     print("=" * 60)
@@ -608,18 +804,18 @@ async def lifespan(app: FastAPI):
         now = _time.time()
         expired = [f for f, i in meta.items() if (now - i["deleted_at"]) / 86400 >= TRASH_DAYS]
         if expired:
-            print(f"\n🧹 发现 {len(expired)} 个过期垃圾桶文件，正在清理...")
+            logger.info(f"[Trash] 发现 {len(expired)} 个过期垃圾桶文件，正在清理...")
             for filename in expired:
                 trash_path = os.path.join(TRASH_DIR, filename)
                 if os.path.exists(trash_path):
                     os.remove(trash_path)
                 meta.pop(filename, None)
-                print(f"   🗑️  已永久删除: {filename}")
+                logger.info(f"[Trash] 已永久删除: {filename}")
             _save_trash_meta(meta)
             remaining = len(meta)
-            print(f"   ✅ 清理完成，垃圾桶剩余 {remaining} 个文件（未过期）\n")
+            logger.info(f"[Trash] 清理完成，剩余 {remaining} 个文件（未过期）")
         else:
-            print(f"\n📦 垃圾桶中有 {len(meta)} 个文件，均未过期\n")
+            logger.info(f"[Trash] 垃圾桶中有 {len(meta)} 个文件，均未过期")
 
     # ── 启动 APScheduler 定时任务 ──
     print("\n[定时任务] 启动 APScheduler...")
@@ -833,6 +1029,8 @@ async def chat(request: ChatRequest):
                 session_store.update_title(sid, title)
 
         # ── 锚点路由判断 ──
+        import time as _time
+        _t0 = _time.perf_counter()
         route = "fast"
         route_hits = 0
         route_tokens = []
@@ -842,22 +1040,68 @@ async def chat(request: ChatRequest):
                 logger.info(f"[Route] → Agentic RAG (命中 {route_hits}/{anchor_mgr.route_threshold} 锚点)")
             else:
                 logger.debug(f"[Route] → Fast RAG (命中 {route_hits} 锚点: {route_tokens[:5]})")
+        _t1 = _time.perf_counter()
 
         # ── 执行 RAG 检索（手动流程，与流式端点一致）──
         loop = asyncio.get_event_loop()
         nodes = await loop.run_in_executor(
             None, query_engine.retriever.retrieve, request.question
         )
+        _t2 = _time.perf_counter()
+        _retrieve_top = float(nodes[0].score) if nodes and nodes[0].score else 0.0
 
-        # Reranker 精排
+        # Reranker 精排（带 LRU 缓存 + 双信号跳过策略）
+        # 跳过条件（必须全部满足）：
+        #   1. keyword_score >= 0.6（强名词高置信命中）
+        #   2. ret_top >= 0.6（向量检索 top1 高置信）
+        #   3. ret_top - ret_top2 >= 0.05（top1 和 top2 分数差距足够大，无歧义）
+        # 不满足任一条件则走 reranker 精排，保证检索质量
         postprocessors = getattr(query_engine, "_node_postprocessors", [])
+        _rerank_skipped = False
         if postprocessors:
             from llama_index.core import QueryBundle
             qb = QueryBundle(request.question)
-            for pp in postprocessors:
-                nodes = await loop.run_in_executor(
-                    None, pp.postprocess_nodes, nodes, qb
+
+            # 计算 keyword_score 提前判断是否跳过
+            _kw_score_early = 0.0
+            if anchor_mgr is not None:
+                _kw_score_early, _ = compute_keyword_score(
+                    request.question, anchor_mgr.anchor_set
                 )
+
+            # 计算 top2 分数差（检测歧义）
+            _ret_top2 = float(nodes[1].score) if len(nodes) >= 2 and nodes[1].score else 0.0
+            _score_gap = _retrieve_top - _ret_top2
+
+            if _kw_score_early >= 0.6 and _retrieve_top >= 0.6 and _score_gap >= 0.05:
+                # 三信号强命中且无歧义，跳过 reranker
+                _rerank_skipped = True
+                logger.info(
+                    f"[Rerank] 跳过（三信号强命中）: kw={_kw_score_early:.4f}, "
+                    f"ret_top={_retrieve_top:.4f}, gap={_score_gap:.4f}"
+                )
+            else:
+                logger.debug(
+                    f"[Rerank] 执行（需要精排）: kw={_kw_score_early:.4f}, "
+                    f"ret_top={_retrieve_top:.4f}, gap={_score_gap:.4f}"
+                )
+                # 构建 cache key：query + 各 node 的 hash
+                _cache_key = (request.question, tuple(
+                    hash(n.node_id) if hasattr(n, "node_id") else hash(n.text[:200])
+                    for n in nodes
+                ))
+                _cached = _rerank_cache_get(_cache_key)
+                if _cached is not None:
+                    nodes = _cached
+                    _rerank_skipped = True
+                    logger.debug(f"[Rerank] cache hit, skip reranker")
+                else:
+                    for pp in postprocessors:
+                        nodes = await loop.run_in_executor(
+                            None, pp.postprocess_nodes, nodes, qb
+                        )
+                    _rerank_cache_set(_cache_key, nodes)
+        _t3 = _time.perf_counter()
 
         # 提取来源片段
         sources = []
@@ -869,27 +1113,59 @@ async def chat(request: ChatRequest):
                 "metadata": dict(node.metadata) if node.metadata else {},
             })
 
-        # ── Agentic RAG: 锚点命中不足 + 检索质量低 → 追问 ──
+        # ── 双信号融合决策（替代原单一 reranker 判断）──
+        # 信号1: reranker top_score
+        # 信号2: keyword_score（关键词命中权重，B-Tree Layer 2 细查）
         top_score = sources[0]["score"] if sources and sources[0].get("score") else 0.0
-        needs_clarification = False
-        if route == "agentic" and top_score < 0.3:
-            needs_clarification = True
-            topic_hints = anchor_mgr.get_topic_hints(8) if anchor_mgr else []
-            hints_str = "、".join(topic_hints[:6]) if topic_hints else "未知"
-            answer = (
-                f"🤔 您的问题「{request.question}」与知识库的匹配度较低"
-                f"（锚点命中 {route_hits}/{anchor_mgr.route_threshold if anchor_mgr else 2}，"
-                f"最高相关度 {top_score:.1%}）。\n\n"
-                f"当前知识库主要涵盖以下主题：**{hints_str}**\n\n"
-                f"请您尝试：\n"
-                f"1. 换一个更具体的问法（例如包含上述关键词）\n"
-                f"2. 或者直接告诉我您想了解哪个方面的内容"
+
+        keyword_score = 0.0
+        matched_keywords = []
+        if anchor_mgr is not None:
+            keyword_score, matched_tokens = compute_keyword_score(
+                request.question, anchor_mgr.anchor_set
             )
-            logger.info(f"[Agentic] 触发追问: top_score={top_score:.4f}, hints={topic_hints[:4]}")
+            matched_keywords = [
+                t["token"] for t in matched_tokens
+                if t.get("in_anchor") and t.get("category") in ("strong_noun", "suffix_noun")
+            ][:8]
+
+        # 融合分数：reranker 权重 0.6，关键词权重 0.4
+        final_score = 0.6 * top_score + 0.4 * keyword_score
+
+        # 决策规则：
+        #   - final_score >= 0.35 → 正常回答
+        #   - 单一强信号（reranker >= 0.5 或 keyword >= 0.5）→ 正常回答
+        #   - 否则 → 追问
+        needs_clarification = False
+        if route == "agentic":
+            if final_score < 0.35 and top_score < 0.5 and keyword_score < 0.5:
+                needs_clarification = True
+                topic_hints = anchor_mgr.get_topic_hints(8) if anchor_mgr else []
+                hints_str = "、".join(topic_hints[:6]) if topic_hints else "未知"
+                answer = (
+                    f"🤔 您的问题「{request.question}」与知识库的匹配度较低"
+                    f"（锚点命中 {route_hits}/{anchor_mgr.route_threshold if anchor_mgr else 2}，"
+                    f"相关度 {top_score:.1%}，关键词匹配 {keyword_score:.1%}）。\n\n"
+                    f"当前知识库主要涵盖以下主题：**{hints_str}**\n\n"
+                    f"请您尝试：\n"
+                    f"1. 换一个更具体的问法（例如包含上述关键词）\n"
+                    f"2. 或者直接告诉我您想了解哪个方面的内容"
+                )
+                logger.info(
+                    f"[Agentic] 触发追问: top_score={top_score:.4f}, "
+                    f"keyword_score={keyword_score:.4f}, final={final_score:.4f}"
+                )
+            else:
+                logger.info(
+                    f"[Agentic] 放行（双信号融合）: top_score={top_score:.4f}, "
+                    f"keyword_score={keyword_score:.4f}, final={final_score:.4f}"
+                )
+
         # ── 检索结果为空 ──
-        elif not sources:
+        _t4 = _time.perf_counter()
+        if not needs_clarification and not sources:
             answer = "⚠️ 知识库中未找到与您问题相关的内容。请尝试换一种问法，或上传相关文档到知识库。"
-        else:
+        elif not needs_clarification:
             # ── 正常 RAG 回答 ──
             context_parts = []
             for i, node in enumerate(nodes, 1):
@@ -906,7 +1182,7 @@ async def chat(request: ChatRequest):
 
             messages.append(ChatMessage(
                 role="user",
-                content=f"参考资料：\n{context}\n\n用户问题：{request.question}\n\n请严格基于上述参考资料回答，不要发散或添加资料中没有的信息。回答要简洁直接。如果资料中未找到相关内容，请明确说明"资料中未找到相关内容"：",
+                content=f'参考资料：\n{context}\n\n用户问题：{request.question}\n\n请严格基于上述参考资料回答，不要发散或添加资料中没有的信息。回答要简洁直接。如果资料中未找到相关内容，请明确说明"资料中未找到相关内容"：',
             ))
 
             # 调用 LLM（非流式）
@@ -914,6 +1190,23 @@ async def chat(request: ChatRequest):
                 None, lambda: Settings.llm.chat(messages)
             )
             answer = llm_response.message.content if hasattr(llm_response, "message") else str(llm_response)
+            _t4 = _time.perf_counter()
+
+        # 阶段耗时日志（定位延迟瓶颈）
+        _latency_log = (
+            f"[Latency] route={(_t1-_t0)*1000:.0f}ms "
+            f"retrieve={(_t2-_t1)*1000:.0f}ms(ret_top={_retrieve_top:.4f}) "
+            f"rerank={(_t3-_t2)*1000:.0f}ms{'(skipped)' if _rerank_skipped else ''} "
+            f"llm={(_t4-_t3)*1000:.0f}ms "
+            f"total={(_t4-_t0)*1000:.0f}ms"
+        )
+        logger.info(_latency_log)
+        # 同时写入文件（避免 Windows 终端编码问题）
+        try:
+            with open("latency.log", "a", encoding="utf-8") as _lf:
+                _lf.write(_latency_log + "\n")
+        except Exception:
+            pass
 
         # ── FactGuard 事实核查（可选）──
         factcheck = None
@@ -939,6 +1232,10 @@ async def chat(request: ChatRequest):
                 "threshold": anchor_mgr.route_threshold if anchor_mgr else 2,
                 "tokens": route_tokens[:10],
                 "needs_clarification": needs_clarification,
+                "top_score": round(top_score, 4),
+                "keyword_score": round(keyword_score, 4),
+                "final_score": round(final_score, 4),
+                "matched_keywords": matched_keywords,
             },
             factcheck=factcheck,
         )
@@ -1113,7 +1410,7 @@ async def chat_stream(request: ChatRequest):
             # 当前问题
             messages.append(ChatMessage(
                 role="user",
-                content=f"参考资料：\n{context}\n\n用户问题：{request.question}\n\n请严格基于上述参考资料回答，不要发散或添加资料中没有的信息。回答要简洁直接。如果资料中未找到相关内容，请明确说明"资料中未找到相关内容"：",
+                content=f'参考资料：\n{context}\n\n用户问题：{request.question}\n\n请严格基于上述参考资料回答，不要发散或添加资料中没有的信息。回答要简洁直接。如果资料中未找到相关内容，请明确说明"资料中未找到相关内容"：',
             ))
 
             # ── 阶段 4: 流式调用 LLM ──
@@ -2592,5 +2889,13 @@ async def update_session_title(session_id: str, title: str):
 # 启动服务
 # ============================================================
 if __name__ == "__main__":
+    # 提升 PyTorch CPU 线程数（默认只用了 8/16 核）
+    try:
+        import torch
+        torch.set_num_threads(12)
+        torch.set_num_interop_threads(4)
+        print(f"[Torch] threads={torch.get_num_threads()}, interop={torch.get_num_interop_threads()}")
+    except Exception as e:
+        print(f"[Torch] 设置线程数失败: {e}")
     import uvicorn
     uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=False)

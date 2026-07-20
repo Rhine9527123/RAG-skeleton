@@ -41,3 +41,7 @@ python-dotenv>=1.0.0
 
 # ---- Streamlit 前端 ----
 streamlit>=1.41.0
+
+# ---- MCP (模型上下文协议) ----
+mcp>=1.0.0
+fastmcp>=0.5.0
